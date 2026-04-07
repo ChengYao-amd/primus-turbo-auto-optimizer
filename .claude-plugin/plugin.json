@@ -1,0 +1,9 @@
+{
+  "name": "primus-optimizer",
+  "description": "Multi-agent operator optimization plugin for Primus-Turbo on AMD GPUs",
+  "version": "0.1.0",
+  "author": {
+    "name": "Primus-Turbo Team"
+  },
+  "keywords": ["optimization", "amd", "gpu", "gemm", "triton", "kernel"]
+}

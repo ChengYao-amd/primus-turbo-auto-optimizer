@@ -63,22 +63,36 @@ git clone <repo-url> primus-optimizer
 pip install rich pyyaml
 ```
 
-### 3. Register skills in Claude Code
+### 3. Install as Claude Code plugin
 
-**Option A: Symlink (recommended)**
+**Method A: Plugin install (recommended)**
 
 ```bash
-# From the primus-optimizer directory
+# In Claude Code, install the plugin from local path
+claude plugin add /path/to/primus-optimizer --scope project
+```
+
+This auto-discovers all 4 skills. After installation, skills are available as:
+- `/primus-optimizer:optimize` -- Coordinator entry point
+- `/primus-optimizer:optimize-worker` -- Worker optimization loop
+- `/primus-optimizer:optimize-review` -- Review + cross-pollination
+- `/primus-optimizer:optimize-knowledge` -- Web knowledge mining
+
+**Method B: Plugin directory flag (development)**
+
+```bash
+# Launch Claude Code with the plugin loaded directly
+claude --plugin-dir /path/to/primus-optimizer
+```
+
+**Method C: Manual symlink (fallback)**
+
+```bash
+# If plugin install is not available, symlink skills manually
 ln -s $(pwd)/skills/optimize ~/.claude/skills/optimize
 ln -s $(pwd)/skills/optimize-worker ~/.claude/skills/optimize-worker
 ln -s $(pwd)/skills/optimize-review ~/.claude/skills/optimize-review
 ln -s $(pwd)/skills/optimize-knowledge ~/.claude/skills/optimize-knowledge
-```
-
-**Option B: Copy**
-
-```bash
-cp -r skills/* ~/.claude/skills/
 ```
 
 ### 4. Configure GPU pool
@@ -158,6 +172,8 @@ The Dashboard is read-only and fully independent — closing it does not affect 
 
 ```
 primus-optimizer/
+├── .claude-plugin/
+│   └── plugin.json              # Plugin manifest (auto-discovery)
 ├── config/
 │   └── optimizer.yaml           # GPU pool, profiles, defaults, knowledge search
 ├── tools/
