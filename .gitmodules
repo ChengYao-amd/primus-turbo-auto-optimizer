@@ -1,0 +1,3 @@
+[submodule "Primus-Turbo"]
+	path = agent_workspace/Primus-Turbo
+	url = git@github.com:AMD-AGI/Primus-Turbo.git
