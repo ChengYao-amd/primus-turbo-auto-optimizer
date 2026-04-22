@@ -31,6 +31,13 @@ ALLOWED_TOOLS = [
     "Bash(mkdir:*)",
     "Bash(cp:*)",
     "Bash(ls:*)",
+    "Bash(pwd:*)",
+    "Bash(readlink:*)",
+    "Bash(pip:*)",
+    "Bash(pip3:*)",
+    "Bash(python:*)",
+    "Bash(python3:*)",
+    "Bash(env:*)",
     "Glob",
     "Grep",
 ]
