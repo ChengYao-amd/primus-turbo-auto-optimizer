@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turbo-optimize"
+version = "0.1.0"
+description = "CLI driver for the Primus-Turbo kernel-optimize skill loop."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Primus-Turbo Auto Optimizer" },
+]
+dependencies = [
+    "claude-agent-sdk>=0.1.60",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+primus-turbo-optimize = "turbo_optimize.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["turbo_optimize*"]
+exclude = ["agent_workspace*", "tests*"]
+
+[tool.setuptools.package-data]
+"turbo_optimize" = ["prompts/*.md"]

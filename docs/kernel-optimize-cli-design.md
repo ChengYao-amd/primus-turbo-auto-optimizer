@@ -355,7 +355,7 @@ if scoring.check_hypothesis_duplicate(hypo, history["verified_ineffective"]):
 | `history.query_trend` | `campaign_dir, limit?` | 最近 N 行趋势表 | ANALYZE 查趋势 |
 | `history.read_best_summary` | `campaign_dir` | current best round 的 summary.md 正文 | ANALYZE / OPTIMIZE 查当前最优版本细节 |
 | `tips.query_tips` | `op, backend, gpu, keyword?` | 匹配的 tip 条目 | READ_HISTORICAL_TIPS / ANALYZE |
-| `tips.append_tip` | `op, backend, gpu, entry` | `{ok: true}` | VALIDATE 后写入跨 campaign 教训 |
+| `tips.append_tip` | `op, backend, gpu, round, status, context, signal, takeaway, applicability` | `{ok: true, path}` | REPORT 末尾统一蒸馏后写入跨 campaign 教训；其他 phase 只读 |
 | `verification.run_quick_validation` | `campaign_dir, shapes?` | 结构化 per-shape pass/fail + metric | VALIDATE 包装 `manifest.quick_command` |
 | `verification.parse_bench_csv` | `path, primary_metric` | 打分向量 | VALIDATE 解析 CSV |
 

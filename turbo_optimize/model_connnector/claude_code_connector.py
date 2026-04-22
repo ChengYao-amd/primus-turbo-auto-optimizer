@@ -51,10 +51,21 @@ AUTH_ENV_KEYS: tuple[str, ...] = (
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "CLAUDE_CODE_EFFORT_LEVEL",
+    "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING",
     # Prevent startup connections that bypass ANTHROPIC_BASE_URL in isolated
     # networks; only picked up when the caller has exported them.
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "CLAUDE_CODE_SKIP_FAST_MODE_NETWORK_ERRORS",
+    # Flag Claude Code treats as "the host is already sandboxed, accept
+    # --dangerously-skip-permissions even though euid==0". Required inside
+    # containers that run as root; see anthropics/claude-code#9184, #3490.
+    "IS_SANDBOX",
 )
 
 
@@ -89,6 +100,52 @@ def load_auth_from_env(
             "(ANTHROPIC_BASE_URL optional for gateways)."
         )
     return picked
+
+
+def _is_root() -> bool:
+    """True when the current process euid is 0.
+
+    ``os.geteuid`` does not exist on Windows; there's no root-vs-user split
+    for the CLI's sandbox heuristic either, so we return False and let the
+    native Claude Code binary decide.
+    """
+    getter = getattr(os, "geteuid", None)
+    if getter is None:
+        return False
+    try:
+        return getter() == 0
+    except OSError:
+        return False
+
+
+def _needs_sandbox_flag(
+    options: ClaudeAgentOptions, merged_env: dict[str, str]
+) -> bool:
+    """Decide whether to auto-inject ``IS_SANDBOX=1`` into the CLI subprocess.
+
+    Triggered only when:
+
+    * the caller asked for ``permission_mode="bypassPermissions"`` — that's
+      the mode Claude Code translates to ``--dangerously-skip-permissions``,
+      which is the flag the root-check rejects;
+    * the current process is root (``euid == 0``), i.e. the typical
+      container default user;
+    * the caller hasn't explicitly opted out by exporting
+      ``IS_SANDBOX=0``. Any non-empty value other than ``0`` is treated as
+      already-configured and left alone.
+
+    Rationale: Anthropic's own guidance for containers is exactly this env
+    var — see anthropics/claude-code issues #9184, #3490, #927. The CLI is
+    sandbox-agnostic; it trusts the caller's ``IS_SANDBOX`` declaration.
+    """
+    if options.permission_mode != "bypassPermissions":
+        return False
+    if not _is_root():
+        return False
+    existing = merged_env.get("IS_SANDBOX")
+    if existing is None:
+        return True
+    return existing.strip() == ""
 
 
 def _format_message(msg: object) -> str | None:
@@ -146,6 +203,9 @@ class ClaudeCodeConnector:
         if load_auth:
             for k, v in load_auth_from_env().items():
                 merged_env.setdefault(k, v)
+
+        if _needs_sandbox_flag(base, merged_env):
+            merged_env["IS_SANDBOX"] = "1"
 
         changes: dict[str, object] = {"env": merged_env}
         if session_id is not None:

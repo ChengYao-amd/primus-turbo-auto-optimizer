@@ -1,2 +1,4 @@
 .claude_code_session.json
 __pycache__
+state/
+*.egg-info
