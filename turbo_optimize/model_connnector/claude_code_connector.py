@@ -244,6 +244,17 @@ class ClaudeCodeConnector:
                 os.unlink(tmp_path)
             raise
 
+    DISCONNECT_TIMEOUT_S: float = 15.0
+    """Bounded wait on :py:meth:`ClaudeSDKClient.disconnect`.
+
+    Level-2 fallback from ``docs/issue.md`` §8.2: after ``interrupt()``
+    times out or an idle timeout fires, ``__aexit__`` must still return
+    within a predictable window so the phase retry loop keeps moving.
+    Exceeding this budget logs a warning and swallows the error (we
+    drop the client reference and rely on process-exit cleanup rather
+    than blocking the orchestrator).
+    """
+
     async def __aenter__(self) -> "ClaudeCodeConnector":
         self._client = ClaudeSDKClient(options=self._options)
         await self._client.connect()
@@ -251,23 +262,78 @@ class ClaudeCodeConnector:
 
     async def __aexit__(self, exc_type, exc, tb) -> bool:
         assert self._client is not None
+        client = self._client
         try:
-            await self._client.disconnect()
+            try:
+                await asyncio.wait_for(
+                    client.disconnect(), timeout=self.DISCONNECT_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                # Level-2 fallback: disconnect itself is wedged. Don't
+                # re-raise — a wedged disconnect must not mask the
+                # upstream exception (idle_timeout / wall_timeout /
+                # PhaseError) that the orchestrator is handling.
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "ClaudeSDKClient.disconnect exceeded %.1fs; "
+                    "proceeding without clean shutdown",
+                    self.DISCONNECT_TIMEOUT_S,
+                )
+            except Exception as disc_exc:  # noqa: BLE001 - best-effort cleanup
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "ClaudeSDKClient.disconnect failed: %r",
+                    disc_exc,
+                )
         finally:
             self._client = None
             self._save_session_id()
         return False
 
-    async def ask(self, prompt: str) -> AsyncIterator[object]:
+    async def ask(
+        self,
+        prompt: str,
+        *,
+        idle_timeout_s: float | None = None,
+    ) -> AsyncIterator[object]:
         """Send ``prompt`` and yield each message until the response completes.
 
         Updates ``session_id`` whenever a ``ResultMessage`` arrives so that
         resuming after the first turn works even before the connector exits.
+
+        When ``idle_timeout_s`` is a positive float, each ``__anext__`` on
+        the SDK message stream is wrapped in :func:`asyncio.wait_for`.
+        A stall longer than ``idle_timeout_s`` seconds surfaces as
+        :class:`asyncio.TimeoutError` so the caller can decide whether to
+        retry (see :func:`turbo_optimize.orchestrator.run_phase._execute_phase`).
+        ``idle_timeout_s=None`` preserves the original unbounded behaviour
+        and is the default — callers that did not opt into the new path
+        are unaffected.
         """
         if self._client is None:
             raise RuntimeError("Connector is not active; use 'async with'.")
         await self._client.query(prompt)
-        async for msg in self._client.receive_response():
+        agen = self._client.receive_response().__aiter__()
+        while True:
+            try:
+                if idle_timeout_s is None or idle_timeout_s <= 0:
+                    msg = await agen.__anext__()
+                else:
+                    msg = await asyncio.wait_for(
+                        agen.__anext__(), timeout=idle_timeout_s
+                    )
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError:
+                # Deliberately propagate so the orchestrator can tag the
+                # failure with phase / last_event_kind context.  We do
+                # NOT try to aclose() the generator here because the
+                # containing connector is about to be torn down via
+                # ``__aexit__`` anyway, and aclose on a stuck stream is
+                # itself subject to the hang.
+                raise
             if isinstance(msg, ResultMessage) and msg.session_id:
                 self._session_id = msg.session_id
             yield msg

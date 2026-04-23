@@ -22,6 +22,7 @@ a one-line change.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -43,13 +44,24 @@ from claude_agent_sdk import (
     UserMessage,
 )
 
-from turbo_optimize.config import CampaignParams
+from turbo_optimize.config import CampaignParams, get_phase_timeouts
+from turbo_optimize.errors import PhaseIdleTimeout, PhaseWallTimeout
 from turbo_optimize.logs import append_cost_row
 from turbo_optimize.model_connnector.claude_code_connector import ClaudeCodeConnector
 from turbo_optimize.signals import GracefulStop, stop_requested
 
 
 log = logging.getLogger(__name__)
+
+
+INTERRUPT_TIMEOUT_S: float = 10.0
+"""Bounded wait for ``ClaudeSDKClient.interrupt``.
+
+Level-1 of the fallback chain described in ``docs/issue.md`` §8.2.
+Level-2 lives inside
+:py:meth:`turbo_optimize.model_connnector.claude_code_connector.ClaudeCodeConnector.__aexit__`
+where ``disconnect`` is wrapped in ``asyncio.wait_for``.
+"""
 
 
 @dataclass
@@ -70,6 +82,14 @@ class PhaseInvocation:
     round_n: int | None = None
     phase_variant: str | None = None
     campaign_dir: Path | None = None
+    idle_timeout_s: float | None = None
+    """Stream-level idle budget. ``None`` keeps the pre-timeout (unbounded) behaviour."""
+    wall_timeout_s: float | None = None
+    """Total phase wall budget across all retries. ``None`` disables the guard."""
+    max_retries: int = 0
+    """Extra attempts after the first one. ``0`` preserves the original no-retry contract."""
+    retriable: bool = False
+    """Opt-in flag per phase. When ``False``, idle timeouts always abort without retry."""
 
 
 @dataclass
@@ -78,6 +98,22 @@ class PhaseOutcome:
     messages_log: Path
     structured: dict[str, Any] | None
     stopped: bool = False
+
+
+@dataclass
+class _AttemptOutcome:
+    """Single attempt inside :func:`_execute_phase`.
+
+    ``last_event_kind`` is threaded back out so that when the outer
+    wall timeout fires mid-attempt we can still emit a useful
+    ``last_event_kind`` field in the transcript event.
+    """
+
+    cost_usd: float = 0.0
+    turns: int = 0
+    sdk_duration_ms: int | None = None
+    stopped: bool = False
+    last_event_kind: str | None = None
 
 
 async def run_phase(
@@ -97,6 +133,10 @@ async def run_phase(
     force: bool = False,
     round_n: int | None = None,
     phase_variant: str | None = None,
+    idle_timeout_s: float | None = None,
+    wall_timeout_s: float | None = None,
+    max_retries: int | None = None,
+    retriable: bool | None = None,
 ) -> PhaseOutcome:
     """Run one phase, possibly reusing a cached structured result.
 
@@ -110,7 +150,27 @@ async def run_phase(
     (they do not affect the prompt or the Claude session). Both are
     optional: phases that run once per campaign leave ``round_n=None``
     and the row renders ``-``.
+
+    The four timeout kwargs (``idle_timeout_s`` / ``wall_timeout_s`` /
+    ``max_retries`` / ``retriable``) default to ``None``; unset values are
+    resolved from
+    :data:`turbo_optimize.config.PHASE_TIMEOUT_DEFAULTS` keyed by ``phase``.
+    Callers that need to opt out can pass ``idle_timeout_s=0``.
     """
+    defaults = get_phase_timeouts(phase, phase_variant)
+    if idle_timeout_s is None:
+        idle_timeout_s = float(defaults["idle"]) if defaults.get("idle") else None
+    elif idle_timeout_s <= 0:
+        idle_timeout_s = None
+    if wall_timeout_s is None:
+        wall_timeout_s = float(defaults["wall"]) if defaults.get("wall") else None
+    elif wall_timeout_s <= 0:
+        wall_timeout_s = None
+    if max_retries is None:
+        max_retries = int(defaults.get("retries", 0) or 0)
+    if retriable is None:
+        retriable = bool(defaults.get("retriable", False))
+
     invocation = PhaseInvocation(
         phase=phase,
         prompt=prompt,
@@ -128,6 +188,10 @@ async def run_phase(
         round_n=round_n,
         phase_variant=phase_variant,
         campaign_dir=campaign_dir,
+        idle_timeout_s=idle_timeout_s,
+        wall_timeout_s=wall_timeout_s,
+        max_retries=max_retries,
+        retriable=retriable,
     )
     messages_log = campaign_dir / "profiles" / f"_transcript_{phase.lower()}.jsonl"
     messages_log.parent.mkdir(parents=True, exist_ok=True)
@@ -242,90 +306,109 @@ async def _execute_phase(
     invocation: PhaseInvocation,
     transcript_path: Path,
 ) -> PhaseOutcome:
-    """Run one phase end-to-end, emitting INFO progress lines on entry/exit.
+    """Run one phase end-to-end with idle- and wall-timeout guards.
 
-    Cost, turn count and SDK-reported duration come from ``ResultMessage``
-    events; we accumulate across all results observed in the stream (a
-    single ``ask`` normally yields one, but the SDK does not guarantee
-    uniqueness for multi-turn phases).
+    Each attempt is a fresh ``ClaudeCodeConnector`` session executed by
+    :func:`_run_single_attempt`. An :class:`~turbo_optimize.errors.PhaseIdleTimeout`
+    from the attempt triggers a retry when ``retriable`` is set and
+    ``attempt < max_retries``; otherwise it propagates. The whole
+    attempt loop is wrapped in :func:`asyncio.wait_for` so a
+    :class:`~turbo_optimize.errors.PhaseWallTimeout` can cap total
+    spend even when individual attempts never go idle.
+
+    Cost, turn count and SDK-reported duration accumulate across every
+    attempt: the ``logs/cost.md`` row reflects the full work, not just
+    the successful final attempt.
     """
-    options = _build_options(invocation)
-    structured: dict[str, Any] | None = None
-    stopped = False
-    total_cost_usd: float = 0.0
-    total_turns: int = 0
-    sdk_duration_ms: int | None = None
-
     log.info(
-        "[%s] phase begin (tools=%d mcp=%d agents=%d transcript=%s)",
+        "[%s] phase begin (tools=%d mcp=%d agents=%d transcript=%s idle=%s wall=%s retries=%d retriable=%s)",
         invocation.phase,
         len(invocation.allowed_tools) + len(invocation.extra_tools),
         len(invocation.mcp_servers),
         len(invocation.agents or {}),
         transcript_path,
+        _fmt_timeout(invocation.idle_timeout_s),
+        _fmt_timeout(invocation.wall_timeout_s),
+        invocation.max_retries,
+        invocation.retriable,
     )
+
+    with transcript_path.open("a", encoding="utf-8") as transcript:
+        transcript.write(
+            _json_line(
+                kind="phase_begin",
+                phase=invocation.phase,
+                prompt_sha=_short_sha(invocation.prompt),
+                allowed_tools=invocation.allowed_tools + invocation.extra_tools,
+                has_mcp=bool(invocation.mcp_servers),
+                has_agents=bool(invocation.agents),
+                idle_timeout_s=invocation.idle_timeout_s,
+                wall_timeout_s=invocation.wall_timeout_s,
+                max_retries=invocation.max_retries,
+                retriable=invocation.retriable,
+            )
+        )
+
     start_wall = time.perf_counter()
+    totals = _AttemptOutcome()
     status = "ok"
+    stopped = False
+    error_to_raise: BaseException | None = None
 
     try:
-        with transcript_path.open("a", encoding="utf-8") as transcript:
-            transcript.write(
-                _json_line(
-                    kind="phase_begin",
-                    phase=invocation.phase,
-                    prompt_sha=_short_sha(invocation.prompt),
-                    allowed_tools=invocation.allowed_tools + invocation.extra_tools,
-                    has_mcp=bool(invocation.mcp_servers),
-                    has_agents=bool(invocation.agents),
-                )
+        if invocation.wall_timeout_s is None:
+            status, stopped = await _attempt_loop(
+                invocation, transcript_path, totals=totals
             )
+        else:
             try:
-                async with ClaudeCodeConnector(options=options) as conn:
-                    assert conn._client is not None
-                    try:
-                        async for msg in conn.ask(invocation.prompt):
-                            _record_message(transcript, msg)
-                            if isinstance(msg, ResultMessage):
-                                cost = getattr(msg, "total_cost_usd", None)
-                                if cost:
-                                    total_cost_usd += float(cost)
-                                turns = getattr(msg, "num_turns", None)
-                                if turns:
-                                    total_turns += int(turns)
-                                dur = getattr(msg, "duration_ms", None)
-                                if dur is not None:
-                                    sdk_duration_ms = int(dur)
-                            if stop_requested():
-                                stopped = True
-                                log.warning(
-                                    "SIGINT during phase %s: interrupting client",
-                                    invocation.phase,
-                                )
-                                try:
-                                    await conn._client.interrupt()
-                                except Exception as exc:  # noqa: BLE001
-                                    log.warning("interrupt failed: %s", exc)
-                                break
-                    finally:
-                        transcript.write(
-                            _json_line(kind="phase_end", phase=invocation.phase)
-                        )
-            except Exception as exc:
-                transcript.write(
-                    _json_line(
-                        kind="phase_error",
-                        phase=invocation.phase,
-                        error=repr(exc),
-                    )
+                status, stopped = await asyncio.wait_for(
+                    _attempt_loop(
+                        invocation, transcript_path, totals=totals
+                    ),
+                    timeout=invocation.wall_timeout_s,
                 )
-                status = f"error:{type(exc).__name__}"
-                raise
-
-        if stopped:
-            status = "interrupted"
+            except asyncio.TimeoutError:
+                elapsed = time.perf_counter() - start_wall
+                _record_transcript_event(
+                    transcript_path,
+                    kind="wall_timeout",
+                    phase=invocation.phase,
+                    elapsed_s=round(elapsed, 3),
+                    wall_timeout_s=invocation.wall_timeout_s,
+                    last_event_kind=totals.last_event_kind,
+                )
+                status = "wall_timeout"
+                error_to_raise = PhaseWallTimeout(
+                    phase=invocation.phase,
+                    elapsed_s=elapsed,
+                )
+    except PhaseIdleTimeout:
+        status = "idle_timeout_exhausted"
+        raise
+    except Exception as exc:
+        status = f"error:{type(exc).__name__}"
+        _record_transcript_event(
+            transcript_path,
+            kind="phase_error",
+            phase=invocation.phase,
+            error=repr(exc),
+        )
+        raise
     finally:
         wall_dt = time.perf_counter() - start_wall
-        sdk_s = None if sdk_duration_ms is None else sdk_duration_ms / 1000.0
+        _record_transcript_event(
+            transcript_path,
+            kind="phase_end",
+            phase=invocation.phase,
+            status=status,
+            wall_s=round(wall_dt, 3),
+        )
+        sdk_s = (
+            None
+            if totals.sdk_duration_ms is None
+            else totals.sdk_duration_ms / 1000.0
+        )
         sdk_dt = "n/a" if sdk_s is None else f"{sdk_s:.1f}s"
         log.info(
             "[%s] phase end status=%s wall=%.1fs sdk=%s turns=%d cost=$%.4f",
@@ -333,21 +416,25 @@ async def _execute_phase(
             status,
             wall_dt,
             sdk_dt,
-            total_turns,
-            total_cost_usd,
+            totals.turns,
+            totals.cost_usd,
         )
         _record_cost(
             invocation,
             status=status,
             wall_s=wall_dt,
             sdk_s=sdk_s,
-            turns=total_turns,
-            cost_usd=total_cost_usd,
+            turns=totals.turns,
+            cost_usd=totals.cost_usd,
         )
+
+    if error_to_raise is not None:
+        raise error_to_raise
 
     if stopped:
         raise GracefulStop(f"phase {invocation.phase} interrupted by SIGINT")
 
+    structured: dict[str, Any] | None = None
     if invocation.expected_output is not None:
         structured = _load_expected_output(invocation.expected_output)
     return PhaseOutcome(
@@ -358,11 +445,236 @@ async def _execute_phase(
     )
 
 
-def _record_message(transcript, msg: Any) -> None:
-    event = _summarize_message(msg)
-    if event is None:
+async def _attempt_loop(
+    invocation: PhaseInvocation,
+    transcript_path: Path,
+    *,
+    totals: _AttemptOutcome,
+) -> tuple[str, bool]:
+    """Run up to ``max_retries+1`` connector sessions for one phase.
+
+    Accumulates cost / turns / sdk duration into ``totals``. Returns
+    ``(status, stopped)`` so the outer ``finally`` can log a single
+    aggregated row. On unrecoverable idle timeout, raises
+    :class:`~turbo_optimize.errors.PhaseIdleTimeout` so the outer
+    handler can tag the status as ``idle_timeout_exhausted``.
+    """
+    status = "ok"
+    stopped = False
+    last_idle_error: PhaseIdleTimeout | None = None
+
+    for attempt in range(invocation.max_retries + 1):
+        if attempt > 0:
+            _record_transcript_event(
+                transcript_path,
+                kind="retry_attempt",
+                phase=invocation.phase,
+                attempt=attempt,
+                reason="idle_timeout",
+                max_retries=invocation.max_retries,
+            )
+
+        try:
+            attempt_outcome = await _run_single_attempt(
+                invocation,
+                transcript_path,
+                attempt=attempt,
+                totals=totals,
+            )
+        except PhaseIdleTimeout as exc:
+            totals.last_event_kind = exc.last_event_kind
+            _record_transcript_event(
+                transcript_path,
+                kind="idle_timeout",
+                phase=invocation.phase,
+                elapsed_s=round(exc.elapsed_s, 3),
+                last_event_kind=exc.last_event_kind,
+                attempt=attempt,
+                idle_timeout_s=invocation.idle_timeout_s,
+            )
+            last_idle_error = exc
+            if invocation.retriable and attempt < invocation.max_retries:
+                log.warning(
+                    "[%s] idle_timeout after %.1fs; retrying (attempt %d/%d)",
+                    invocation.phase,
+                    exc.elapsed_s,
+                    attempt + 1,
+                    invocation.max_retries,
+                )
+                status = "idle_timeout_retrying"
+                continue
+            # Retries exhausted or phase not marked retriable.
+            raise
+
+        stopped = attempt_outcome.stopped
+        if stopped:
+            status = "interrupted"
+        elif attempt > 0:
+            status = "idle_timeout_retry_ok"
+        else:
+            status = "ok"
+        return status, stopped
+
+    # Defensive: loop either returned, raised, or continued until
+    # exhaustion. If control reaches here it means ``max_retries < 0``
+    # or a logic bug; surface the last error rather than silently
+    # claiming success.
+    if last_idle_error is not None:
+        raise last_idle_error
+    return status, stopped
+
+
+async def _run_single_attempt(
+    invocation: PhaseInvocation,
+    transcript_path: Path,
+    *,
+    attempt: int,
+    totals: _AttemptOutcome,
+) -> _AttemptOutcome:
+    """Open one connector, drain the response stream, and return totals.
+
+    A fresh ``ClaudeCodeConnector`` per attempt is deliberate: retrying
+    after an idle timeout should not try to ``resume=`` a session that
+    almost certainly has mismatched tool_use / tool_result pairs on the
+    remote side (see ``docs/issue.md`` §11.5).
+
+    ``totals`` is updated *live* (as each ``ResultMessage`` arrives) so
+    a wall-timeout cancellation mid-attempt still records the partial
+    spend to ``logs/cost.md`` instead of silently dropping it.
+    """
+    options = _build_options(invocation)
+    outcome = _AttemptOutcome()
+    attempt_start = time.monotonic()
+
+    with transcript_path.open("a", encoding="utf-8") as transcript:
+        _record_transcript_event_to(
+            transcript,
+            kind="attempt_begin",
+            phase=invocation.phase,
+            attempt=attempt,
+        )
+        try:
+            async with ClaudeCodeConnector(options=options) as conn:
+                assert conn._client is not None
+                last_event_at = time.monotonic()
+                try:
+                    async for msg in conn.ask(
+                        invocation.prompt,
+                        idle_timeout_s=invocation.idle_timeout_s,
+                    ):
+                        last_event_at = time.monotonic()
+                        event = _summarize_message(msg)
+                        if event is not None:
+                            outcome.last_event_kind = event.get("kind")
+                            totals.last_event_kind = outcome.last_event_kind
+                            transcript.write(_json_line(**event))
+                        if isinstance(msg, ResultMessage):
+                            cost = getattr(msg, "total_cost_usd", None)
+                            if cost:
+                                outcome.cost_usd += float(cost)
+                                totals.cost_usd += float(cost)
+                            turns = getattr(msg, "num_turns", None)
+                            if turns:
+                                outcome.turns += int(turns)
+                                totals.turns += int(turns)
+                            dur = getattr(msg, "duration_ms", None)
+                            if dur is not None:
+                                outcome.sdk_duration_ms = int(dur)
+                                totals.sdk_duration_ms = int(dur)
+                        if stop_requested():
+                            outcome.stopped = True
+                            log.warning(
+                                "SIGINT during phase %s: interrupting client",
+                                invocation.phase,
+                            )
+                            await _interrupt_with_timeout(conn)
+                            break
+                except asyncio.TimeoutError as exc:
+                    elapsed = time.monotonic() - last_event_at
+                    log.warning(
+                        "[%s] idle stall detected after %.1fs (last=%s); "
+                        "interrupting attempt %d",
+                        invocation.phase,
+                        elapsed,
+                        outcome.last_event_kind,
+                        attempt,
+                    )
+                    await _interrupt_with_timeout(conn)
+                    raise PhaseIdleTimeout(
+                        phase=invocation.phase,
+                        elapsed_s=elapsed,
+                        last_event_kind=outcome.last_event_kind,
+                    ) from exc
+        finally:
+            attempt_wall = time.monotonic() - attempt_start
+            _record_transcript_event_to(
+                transcript,
+                kind="attempt_end",
+                phase=invocation.phase,
+                attempt=attempt,
+                wall_s=round(attempt_wall, 3),
+                cost_usd=round(outcome.cost_usd, 6),
+                turns=outcome.turns,
+                stopped=outcome.stopped,
+            )
+
+    return outcome
+
+
+async def _interrupt_with_timeout(
+    conn: ClaudeCodeConnector,
+    *,
+    timeout_s: float = INTERRUPT_TIMEOUT_S,
+) -> None:
+    """Best-effort :py:meth:`ClaudeSDKClient.interrupt` wrapped in ``wait_for``.
+
+    Level-1 of the three-stage fallback chain from ``docs/issue.md``
+    §8.2. A stuck interrupt must not block the orchestrator; the
+    connector's ``__aexit__`` will still run afterwards with its own
+    bounded ``disconnect`` (Level-2). Any error surfaced here is logged
+    and swallowed.
+    """
+    client = getattr(conn, "_client", None)
+    if client is None:
         return
-    transcript.write(_json_line(**event))
+    try:
+        await asyncio.wait_for(client.interrupt(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        log.warning(
+            "interrupt did not complete within %.1fs; continuing to disconnect",
+            timeout_s,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+        log.warning("interrupt failed: %r", exc)
+
+
+def _record_transcript_event(
+    transcript_path: Path, *, kind: str, **fields: Any
+) -> None:
+    """Append a synthetic (non-SDK) event to the transcript jsonl.
+
+    Used for ``phase_begin`` / ``phase_end`` / ``phase_error`` and the
+    new timeout- / retry- related events. Swallows IO errors so a
+    transcript write failure never masks the underlying phase outcome.
+    """
+    try:
+        with transcript_path.open("a", encoding="utf-8") as f:
+            _record_transcript_event_to(f, kind=kind, **fields)
+    except OSError as exc:
+        log.warning("could not write transcript event %s: %s", kind, exc)
+
+
+def _record_transcript_event_to(handle, *, kind: str, **fields: Any) -> None:
+    """Write one synthetic event to an already-open transcript handle."""
+    payload = {"kind": kind, "ts": datetime.now().isoformat(timespec="seconds")}
+    payload.update(fields)
+    handle.write(_json_line(**payload))
+
+
+def _fmt_timeout(value: float | None) -> str:
+    if value is None:
+        return "off"
+    return f"{value:.0f}s"
 
 
 def _summarize_message(msg: Any) -> dict[str, Any] | None:

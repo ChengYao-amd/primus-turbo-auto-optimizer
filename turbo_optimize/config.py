@@ -29,6 +29,75 @@ the reasoning."""
 EFFORT_CHOICES: tuple[str, ...] = ("low", "medium", "high", "max")
 
 
+PHASE_TIMEOUT_DEFAULTS: dict[str, dict[str, object]] = {
+    # Empirical basis: 80+ phase executions across
+    # ``optimize_gemm_fp8_blockwise_kernel_with_triton_b_202604220415``
+    # (10 rounds) and ``...221559`` (10 rounds, with PROFILE enabled).
+    # For each phase we take the observed max wall and aim for
+    # ``wall >= P95 * 1.7`` (rule of thumb); idle >= ``avg-turn-gap * 1.5``
+    # plus slack for the longest single silent sub-step (autotune,
+    # pip install, cmake configure, rocprof capture, WebFetch).
+    #
+    # Keys may be either ``"PHASE"`` or ``"PHASE (variant)"``; see
+    # :func:`get_phase_timeouts` for lookup precedence. ``VALIDATE``
+    # is the main reason per-variant entries exist: quick and full
+    # have ~5x different work envelopes.
+    #
+    # ``idle``   — seconds between two adjacent SDK messages.
+    # ``wall``   — hard upper bound for the whole phase including retries.
+    # ``retries`` — how many extra attempts after idle timeout.
+    # ``retriable`` — whether a retry is safe (idempotent side-effects).
+    "DEFINE_TARGET":        {"idle": 90,  "wall": 600,  "retries": 1, "retriable": True},
+    "PREPARE_ENVIRONMENT":  {"idle": 300, "wall": 3600, "retries": 0, "retriable": False},
+    "SURVEY_RELATED_WORK":  {"idle": 180, "wall": 1500, "retries": 1, "retriable": True},
+    "READ_HISTORICAL_TIPS": {"idle": 60,  "wall": 300,  "retries": 1, "retriable": True},
+    "BASELINE":             {"idle": 420, "wall": 5400, "retries": 0, "retriable": False},
+    "PROFILE":              {"idle": 150, "wall": 1200, "retries": 1, "retriable": True},
+    "ANALYZE":              {"idle": 240, "wall": 1800, "retries": 1, "retriable": True},
+    "OPTIMIZE":             {"idle": 300, "wall": 3600, "retries": 0, "retriable": False},
+    "VALIDATE":             {"idle": 300, "wall": 5400, "retries": 0, "retriable": False},
+    "VALIDATE (quick)":     {"idle": 300, "wall": 1800, "retries": 0, "retriable": False},
+    "VALIDATE (full)":      {"idle": 360, "wall": 5400, "retries": 0, "retriable": False},
+    "STAGNATION_REVIEW":    {"idle": 180, "wall": 900,  "retries": 1, "retriable": True},
+    "REPORT":               {"idle": 150, "wall": 900,  "retries": 1, "retriable": True},
+}
+
+PHASE_TIMEOUT_FALLBACK: dict[str, object] = {
+    # Used when a phase name is not registered above. Keep generous so
+    # new / experimental phases never regress into a silent hang, but
+    # not so large that a real stall sits for hours.
+    "idle": 300,
+    "wall": 3600,
+    "retries": 0,
+    "retriable": False,
+}
+
+
+def get_phase_timeouts(
+    phase: str, phase_variant: str | None = None
+) -> dict[str, object]:
+    """Return the default idle/wall/retries/retriable tuple for ``phase``.
+
+    Lookup precedence (first match wins):
+
+    1. ``"PHASE (variant)"`` — variant-scoped entry (e.g.
+       ``"VALIDATE (quick)"`` vs ``"VALIDATE (full)"``).
+    2. ``"PHASE"`` — phase-only entry, used when no variant-specific
+       tuning is needed.
+    3. :data:`PHASE_TIMEOUT_FALLBACK` — conservative defaults for
+       unregistered phases.
+
+    Callers of :func:`turbo_optimize.orchestrator.run_phase.run_phase`
+    may still override any field via explicit kwargs; the table is
+    only consulted when the caller leaves a slot as ``None``.
+    """
+    if phase_variant:
+        variant_key = f"{phase} ({phase_variant})"
+        if variant_key in PHASE_TIMEOUT_DEFAULTS:
+            return dict(PHASE_TIMEOUT_DEFAULTS[variant_key])
+    return dict(PHASE_TIMEOUT_DEFAULTS.get(phase, PHASE_TIMEOUT_FALLBACK))
+
+
 @dataclass
 class CampaignParams:
     """Runtime parameters for a single optimization campaign."""

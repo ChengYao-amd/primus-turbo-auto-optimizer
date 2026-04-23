@@ -41,7 +41,9 @@ class _FakeConnector:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def ask(self, prompt: str):  # noqa: D401 - matches real signature
+    async def ask(
+        self, prompt: str, *, idle_timeout_s: float | None = None
+    ):  # noqa: D401 - matches real signature
         for msg in self._messages:
             yield msg
 
@@ -205,9 +207,9 @@ def test_run_phase_ignores_invalid_cache(tmp_path, monkeypatch, caplog):
             super().__init__(messages)
             self._target = target
 
-        async def ask(self, prompt):
+        async def ask(self, prompt, *, idle_timeout_s: float | None = None):
             self._target.write_text('{"rewritten": true}', encoding="utf-8")
-            async for msg in super().ask(prompt):
+            async for msg in super().ask(prompt, idle_timeout_s=idle_timeout_s):
                 yield msg
 
     def _factory(*, options):
