@@ -47,6 +47,40 @@ from claude_agent_sdk import (
 
 DEFAULT_SESSION_FILE = Path(".claude_code_session.json")
 
+BASH_IDLE_SLACK_S: float = 5.0
+"""Extra wall-clock slack added on top of a Bash tool ``timeout``.
+
+``Bash`` tool_use blocks from Claude Code carry a ``timeout`` field
+(milliseconds) that caps the subprocess lifetime *inside the CLI*.
+The SDK still needs a few seconds to serialize the resulting
+``ToolResult`` back to us once Bash returns or is SIGKILL'd, so we
+tack on a small fixed margin before raising :class:`PhaseIdleTimeout`.
+"""
+
+
+def _extract_pending_bash_timeout_s(msg: object) -> float:
+    """Return the longest ``Bash`` tool_use ``timeout`` declared in ``msg``.
+
+    The CLI reports Bash ``timeout`` in milliseconds; this helper
+    converts to seconds so callers can compare against a seconds-scale
+    idle budget.  Multiple parallel Bash calls in one turn collapse to
+    the max — the one that dominates wall time also dominates the idle
+    budget we need to reserve.  Returns ``0.0`` when ``msg`` is not an
+    :class:`AssistantMessage` or has no Bash tool_use carrying an
+    explicit positive ``timeout``.
+    """
+    if not isinstance(msg, AssistantMessage):
+        return 0.0
+    longest_ms: float = 0.0
+    for block in msg.content:
+        if not isinstance(block, ToolUseBlock) or block.name != "Bash":
+            continue
+        raw = block.input.get("timeout") if isinstance(block.input, dict) else None
+        if not isinstance(raw, (int, float)) or raw <= 0:
+            continue
+        longest_ms = max(longest_ms, float(raw))
+    return longest_ms / 1000.0
+
 AUTH_ENV_KEYS: tuple[str, ...] = (
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_AUTH_TOKEN",
@@ -311,18 +345,39 @@ class ClaudeCodeConnector:
         ``idle_timeout_s=None`` preserves the original unbounded behaviour
         and is the default — callers that did not opt into the new path
         are unaffected.
+
+        A long-running ``Bash`` tool call is a legitimate source of stream
+        silence: between the ``tool_use`` emission and the eventual
+        ``tool_result`` the SDK genuinely has nothing to deliver.  When the
+        most recent :class:`AssistantMessage` declared a Bash tool_use with
+        an explicit ``timeout``, the idle budget for subsequent
+        ``__anext__`` calls is raised to
+        ``max(idle_timeout_s, bash_timeout_s) + BASH_IDLE_SLACK_S`` and
+        reset whenever a new ``AssistantMessage`` arrives.  This keeps the
+        stall guard honest while eliminating the false-positive observed
+        in the 2026-04-23 ``VALIDATE (full)`` campaign where a 498s
+        ``pytest`` dominated a 360s idle budget.
         """
         if self._client is None:
             raise RuntimeError("Connector is not active; use 'async with'.")
         await self._client.query(prompt)
         agen = self._client.receive_response().__aiter__()
+        pending_bash_timeout_s: float = 0.0
         while True:
+            if idle_timeout_s is None or idle_timeout_s <= 0:
+                effective_idle: float | None = None
+            elif pending_bash_timeout_s > 0:
+                effective_idle = (
+                    max(idle_timeout_s, pending_bash_timeout_s) + BASH_IDLE_SLACK_S
+                )
+            else:
+                effective_idle = idle_timeout_s
             try:
-                if idle_timeout_s is None or idle_timeout_s <= 0:
+                if effective_idle is None:
                     msg = await agen.__anext__()
                 else:
                     msg = await asyncio.wait_for(
-                        agen.__anext__(), timeout=idle_timeout_s
+                        agen.__anext__(), timeout=effective_idle
                     )
             except StopAsyncIteration:
                 return
@@ -336,6 +391,11 @@ class ClaudeCodeConnector:
                 raise
             if isinstance(msg, ResultMessage) and msg.session_id:
                 self._session_id = msg.session_id
+            if isinstance(msg, AssistantMessage):
+                # Recompute on every assistant turn: the previous Bash's
+                # extended budget expires once the agent regains control,
+                # and the new turn may or may not declare its own Bash.
+                pending_bash_timeout_s = _extract_pending_bash_timeout_s(msg)
             yield msg
 
 

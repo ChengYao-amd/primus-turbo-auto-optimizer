@@ -5,15 +5,38 @@ Claude Code's native root check rejects ``--dangerously-skip-permissions``
 when ``euid == 0``. Inside containers we're already sandboxed and exporting
 ``IS_SANDBOX=1`` is Anthropic's documented opt-in. The connector must
 insert that flag automatically so callers don't have to remember.
+
+Also covers the Bash-aware idle extension introduced after the 2026-04-23
+``VALIDATE (full)`` false-positive: when the most recent ``AssistantMessage``
+declared a Bash tool_use carrying an explicit ``timeout``, the next
+``__anext__`` on the SDK stream is waited on with
+``max(idle_timeout_s, bash_timeout_s) + BASH_IDLE_SLACK_S`` so a
+long-running Bash (pytest, 288-shape benchmark, rocprof) cannot trip
+:class:`asyncio.TimeoutError` purely because its native ``timeout``
+exceeds the phase-level ``idle_timeout_s``.
 """
 
 from __future__ import annotations
 
-import pytest
-from claude_agent_sdk import ClaudeAgentOptions
+import asyncio
+from collections.abc import AsyncIterator
+from typing import Iterable
 
+import pytest
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ResultMessage,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
+
+from turbo_optimize.model_connnector import claude_code_connector as connector_mod
 from turbo_optimize.model_connnector.claude_code_connector import (
+    BASH_IDLE_SLACK_S,
     ClaudeCodeConnector,
+    _extract_pending_bash_timeout_s,
     _needs_sandbox_flag,
 )
 
@@ -83,3 +106,231 @@ def test_needs_sandbox_flag_pure(monkeypatch):
 
     _force_root(monkeypatch, is_root=False)
     assert _needs_sandbox_flag(opts, {}) is False
+
+
+def _bash_assistant(bash_timeout_ms: int | None, *, name: str = "Bash") -> AssistantMessage:
+    """Build a minimal AssistantMessage with one tool_use block."""
+    input_payload: dict[str, object] = {"command": "echo hi"}
+    if bash_timeout_ms is not None:
+        input_payload["timeout"] = bash_timeout_ms
+    return AssistantMessage(
+        content=[ToolUseBlock(id="tu1", name=name, input=input_payload)],
+        model="claude-fake",
+    )
+
+
+def test_extract_pending_bash_timeout_happy_path():
+    msg = _bash_assistant(600_000)
+    assert _extract_pending_bash_timeout_s(msg) == 600.0
+
+
+def test_extract_pending_bash_timeout_non_bash_tool_is_zero():
+    msg = _bash_assistant(600_000, name="Read")
+    assert _extract_pending_bash_timeout_s(msg) == 0.0
+
+
+def test_extract_pending_bash_timeout_missing_field_is_zero():
+    msg = _bash_assistant(None)
+    assert _extract_pending_bash_timeout_s(msg) == 0.0
+
+
+def test_extract_pending_bash_timeout_non_assistant_is_zero():
+    msg = UserMessage(
+        content=[ToolResultBlock(tool_use_id="tu1", content="ok", is_error=False)]
+    )
+    assert _extract_pending_bash_timeout_s(msg) == 0.0
+
+
+def test_extract_pending_bash_timeout_takes_max_of_multiple_bash():
+    msg = AssistantMessage(
+        content=[
+            ToolUseBlock(id="a", name="Bash", input={"command": "ls", "timeout": 30_000}),
+            ToolUseBlock(
+                id="b", name="Bash", input={"command": "pytest", "timeout": 600_000}
+            ),
+        ],
+        model="claude-fake",
+    )
+    assert _extract_pending_bash_timeout_s(msg) == 600.0
+
+
+def test_extract_pending_bash_timeout_ignores_non_positive_and_non_numeric():
+    msg = AssistantMessage(
+        content=[
+            ToolUseBlock(id="a", name="Bash", input={"command": "ls", "timeout": -5}),
+            ToolUseBlock(id="b", name="Bash", input={"command": "ls", "timeout": "5000"}),
+            ToolUseBlock(id="c", name="Bash", input={"command": "ls", "timeout": 0}),
+        ],
+        model="claude-fake",
+    )
+    assert _extract_pending_bash_timeout_s(msg) == 0.0
+
+
+class _FakeSDKClient:
+    """Minimal stand-in for ``ClaudeSDKClient`` used by the idle tests.
+
+    ``messages`` and ``delays`` are parallel lists: for each yielded
+    message the generator first sleeps ``delays[i]`` seconds.  That lets
+    tests place deterministic gaps between the ``Bash`` tool_use and its
+    eventual ``tool_result`` to exercise (or bypass) the idle guard.
+    """
+
+    def __init__(
+        self, messages: Iterable[object], delays: Iterable[float]
+    ) -> None:
+        self._messages = list(messages)
+        self._delays = list(delays)
+        self.queries: list[str] = []
+
+    async def connect(self) -> None:
+        pass
+
+    async def disconnect(self) -> None:
+        pass
+
+    async def query(self, prompt: str) -> None:
+        self.queries.append(prompt)
+
+    def receive_response(self) -> AsyncIterator[object]:
+        async def _gen() -> AsyncIterator[object]:
+            for delay, msg in zip(self._delays, self._messages):
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                yield msg
+
+        return _gen()
+
+
+def _patch_sdk_client(monkeypatch, fake: _FakeSDKClient) -> None:
+    monkeypatch.setattr(
+        connector_mod, "ClaudeSDKClient", lambda options: fake
+    )
+
+
+def _result_message(session_id: str = "sess-fake", cost: float = 0.0) -> ResultMessage:
+    return ResultMessage(
+        subtype="success",
+        duration_ms=10,
+        duration_api_ms=10,
+        is_error=False,
+        num_turns=1,
+        session_id=session_id,
+        total_cost_usd=cost,
+    )
+
+
+def test_idle_extended_when_bash_timeout_exceeds_budget(monkeypatch):
+    """A 0.4s gap under a 0.1s idle must be tolerated when Bash.timeout=5s.
+
+    Without the extension the ``tool_result`` gap (0.4s) would trip
+    :class:`asyncio.TimeoutError`; with extension the effective budget is
+    ``max(0.1, 5.0) + BASH_IDLE_SLACK_S = 10.0s`` and the stream
+    completes normally.
+    """
+    assistant = _bash_assistant(5_000)  # 5s Bash timeout
+    tool_result = UserMessage(
+        content=[ToolResultBlock(tool_use_id="tu1", content="ok", is_error=False)]
+    )
+    result = _result_message()
+    fake = _FakeSDKClient(
+        messages=[assistant, tool_result, result],
+        delays=[0.01, 0.4, 0.01],
+    )
+    _patch_sdk_client(monkeypatch, fake)
+
+    async def _drive() -> list[object]:
+        async with ClaudeCodeConnector(load_auth=False) as conn:
+            return [msg async for msg in conn.ask("hi", idle_timeout_s=0.1)]
+
+    got = asyncio.run(_drive())
+    assert [type(m).__name__ for m in got] == [
+        "AssistantMessage",
+        "UserMessage",
+        "ResultMessage",
+    ]
+    assert fake.queries == ["hi"]
+
+
+def test_idle_still_fires_without_pending_bash(monkeypatch):
+    """Non-Bash tool_use (or Bash without timeout) keeps the strict idle guard."""
+    assistant = AssistantMessage(
+        content=[ToolUseBlock(id="r1", name="Read", input={"path": "x"})],
+        model="claude-fake",
+    )
+    tool_result = UserMessage(
+        content=[ToolResultBlock(tool_use_id="r1", content="ok", is_error=False)]
+    )
+    fake = _FakeSDKClient(
+        messages=[assistant, tool_result, _result_message()],
+        delays=[0.01, 0.4, 0.01],
+    )
+    _patch_sdk_client(monkeypatch, fake)
+
+    async def _drive() -> list[object]:
+        async with ClaudeCodeConnector(load_auth=False) as conn:
+            return [msg async for msg in conn.ask("hi", idle_timeout_s=0.1)]
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(_drive())
+
+
+def test_idle_resets_when_next_assistant_turn_has_no_bash(monkeypatch):
+    """After a Bash turn, the next assistant turn must reset the budget.
+
+    Stream layout:
+      1. AssistantMessage(Bash, timeout=5000)      <- enables extension
+      2. UserMessage(tool_result)                  <- covered by extension
+      3. AssistantMessage(Read, no Bash)           <- resets pending=0
+      4. UserMessage(tool_result_for_read)         <- 0.4s gap, should FAIL
+    """
+    bash_turn = _bash_assistant(5_000)
+    bash_result = UserMessage(
+        content=[ToolResultBlock(tool_use_id="tu1", content="ok", is_error=False)]
+    )
+    read_turn = AssistantMessage(
+        content=[ToolUseBlock(id="r1", name="Read", input={"path": "x"})],
+        model="claude-fake",
+    )
+    read_result = UserMessage(
+        content=[ToolResultBlock(tool_use_id="r1", content="ok", is_error=False)]
+    )
+    fake = _FakeSDKClient(
+        messages=[bash_turn, bash_result, read_turn, read_result],
+        delays=[0.01, 0.05, 0.01, 0.4],
+    )
+    _patch_sdk_client(monkeypatch, fake)
+
+    async def _drive() -> None:
+        async with ClaudeCodeConnector(load_auth=False) as conn:
+            async for _ in conn.ask("hi", idle_timeout_s=0.1):
+                pass
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(_drive())
+
+
+def test_bash_slack_constant_is_applied(monkeypatch):
+    """The ``+ BASH_IDLE_SLACK_S`` margin must be honoured.
+
+    Bash.timeout = 0.1s, idle = 0.05s, real tool_result gap = slack - 0.5s.
+    Without the slack, effective budget would be max(0.05, 0.1) = 0.1s <
+    the gap, and the call would time out.  With slack added the budget
+    is 0.1 + BASH_IDLE_SLACK_S seconds so the gap is comfortably inside.
+    """
+    assistant = _bash_assistant(100)  # 0.1s
+    gap = BASH_IDLE_SLACK_S - 0.5
+    tool_result = UserMessage(
+        content=[ToolResultBlock(tool_use_id="tu1", content="ok", is_error=False)]
+    )
+    fake = _FakeSDKClient(
+        messages=[assistant, tool_result, _result_message()],
+        delays=[0.01, gap, 0.01],
+    )
+    _patch_sdk_client(monkeypatch, fake)
+
+    async def _drive() -> list[object]:
+        async with ClaudeCodeConnector(load_auth=False) as conn:
+            return [msg async for msg in conn.ask("hi", idle_timeout_s=0.05)]
+
+    got = asyncio.run(_drive())
+    assert len(got) == 3

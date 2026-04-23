@@ -30,13 +30,25 @@ EFFORT_CHOICES: tuple[str, ...] = ("low", "medium", "high", "max")
 
 
 PHASE_TIMEOUT_DEFAULTS: dict[str, dict[str, object]] = {
-    # Empirical basis: 80+ phase executions across
-    # ``optimize_gemm_fp8_blockwise_kernel_with_triton_b_202604220415``
-    # (10 rounds) and ``...221559`` (10 rounds, with PROFILE enabled).
-    # For each phase we take the observed max wall and aim for
-    # ``wall >= P95 * 1.7`` (rule of thumb); idle >= ``avg-turn-gap * 1.5``
-    # plus slack for the longest single silent sub-step (autotune,
-    # pip install, cmake configure, rocprof capture, WebFetch).
+    # Sizing model (updated 2026-04-23 after the
+    # ``optimize_grouped_gemm_fp8_tensorwise_triton_back_202604231027``
+    # false-positive where ``VALIDATE (full)`` idle=360 fired mid-pytest):
+    #
+    #   idle >= 1.5 * worst_single_silent_subtask + stream_keepalive_slack
+    #
+    # During a long Bash tool call the SDK stream is genuinely silent
+    # between the ``tool_use`` emission and the eventual ``tool_result``;
+    # idle must cover that full interval, not the average turn gap.
+    # Observed worst cases on the primus-turbo benchmark rigs:
+    #
+    #   * ``benchmark_command`` 288-shape sweep   ≈ 1000s (≈17 min)
+    #   * ``test_command`` pytest + Triton autotune cache miss ≈ 500s
+    #   * ``quick_command`` autotune warm-up       ≈ 200s
+    #   * ``rocprof`` capture on MI300             ≈ 300s
+    #   * ``pip install`` of project with compile  ≈ 400s
+    #   * ``WebFetch`` large doc + retries         ≈ 90s
+    #
+    # ``wall`` still follows ``P95 * 1.7`` across all retries.
     #
     # Keys may be either ``"PHASE"`` or ``"PHASE (variant)"``; see
     # :func:`get_phase_timeouts` for lookup precedence. ``VALIDATE``
@@ -47,26 +59,26 @@ PHASE_TIMEOUT_DEFAULTS: dict[str, dict[str, object]] = {
     # ``wall``   — hard upper bound for the whole phase including retries.
     # ``retries`` — how many extra attempts after idle timeout.
     # ``retriable`` — whether a retry is safe (idempotent side-effects).
-    "DEFINE_TARGET":        {"idle": 90,  "wall": 600,  "retries": 1, "retriable": True},
-    "PREPARE_ENVIRONMENT":  {"idle": 300, "wall": 3600, "retries": 0, "retriable": False},
-    "SURVEY_RELATED_WORK":  {"idle": 180, "wall": 1500, "retries": 1, "retriable": True},
-    "READ_HISTORICAL_TIPS": {"idle": 60,  "wall": 300,  "retries": 1, "retriable": True},
-    "BASELINE":             {"idle": 420, "wall": 5400, "retries": 0, "retriable": False},
-    "PROFILE":              {"idle": 150, "wall": 1200, "retries": 1, "retriable": True},
-    "ANALYZE":              {"idle": 240, "wall": 1800, "retries": 1, "retriable": True},
-    "OPTIMIZE":             {"idle": 300, "wall": 3600, "retries": 0, "retriable": False},
-    "VALIDATE":             {"idle": 300, "wall": 5400, "retries": 0, "retriable": False},
-    "VALIDATE (quick)":     {"idle": 300, "wall": 1800, "retries": 0, "retriable": False},
-    "VALIDATE (full)":      {"idle": 360, "wall": 5400, "retries": 0, "retriable": False},
-    "STAGNATION_REVIEW":    {"idle": 180, "wall": 900,  "retries": 1, "retriable": True},
-    "REPORT":               {"idle": 150, "wall": 900,  "retries": 1, "retriable": True},
+    "DEFINE_TARGET":        {"idle": 300,  "wall": 900,  "retries": 1, "retriable": True},
+    "PREPARE_ENVIRONMENT":  {"idle": 900,  "wall": 5400, "retries": 0, "retriable": False},
+    "SURVEY_RELATED_WORK":  {"idle": 300,  "wall": 1800, "retries": 1, "retriable": True},
+    "READ_HISTORICAL_TIPS": {"idle": 180,  "wall": 600,  "retries": 1, "retriable": True},
+    "BASELINE":             {"idle": 1500, "wall": 7200, "retries": 0, "retriable": False},
+    "PROFILE":              {"idle": 600,  "wall": 2400, "retries": 1, "retriable": True},
+    "ANALYZE":              {"idle": 420,  "wall": 2400, "retries": 1, "retriable": True},
+    "OPTIMIZE":             {"idle": 600,  "wall": 3600, "retries": 0, "retriable": False},
+    "VALIDATE":             {"idle": 1500, "wall": 7200, "retries": 0, "retriable": False},
+    "VALIDATE (quick)":     {"idle": 600,  "wall": 2400, "retries": 0, "retriable": False},
+    "VALIDATE (full)":      {"idle": 1500, "wall": 7200, "retries": 0, "retriable": False},
+    "STAGNATION_REVIEW":    {"idle": 300,  "wall": 1200, "retries": 1, "retriable": True},
+    "REPORT":               {"idle": 300,  "wall": 1200, "retries": 1, "retriable": True},
 }
 
 PHASE_TIMEOUT_FALLBACK: dict[str, object] = {
     # Used when a phase name is not registered above. Keep generous so
     # new / experimental phases never regress into a silent hang, but
     # not so large that a real stall sits for hours.
-    "idle": 300,
+    "idle": 600,
     "wall": 3600,
     "retries": 0,
     "retriable": False,
