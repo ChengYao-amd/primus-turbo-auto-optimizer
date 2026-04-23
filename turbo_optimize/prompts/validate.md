@@ -35,23 +35,54 @@ Validation level for this round: `{validation_level}` (`quick` by default;
 the orchestrator upgrades to `full` when the direction completes, the
 improvement is near noise, or the change is high-risk).
 
+## Measurement-consistency contract
+
+`{campaign_dir}/rounds/round-{round_n}/artifacts/benchmark.csv` is the
+single source of truth for this round's `aggregate_score`,
+`score_vector`, and `trend_row`. It MUST be produced by the SAME
+`quick_command` harness that BASELINE used, over the SAME
+`representative_shapes`, regardless of whether `{validation_level}` is
+`quick` or `full`. The orchestrator's per-round regression gate
+compares this CSV shape-by-shape against round-1's
+`benchmark.csv`; any schema or shape-set drift silently disables the
+gate.
+
+When `{validation_level}=full` you MAY also run `benchmark_command` as
+an archival coverage sweep and save the result to
+`full_benchmark.csv` / `full_benchmark.log` — but that CSV must not be
+used for the score. See step 1 below.
+
 {workspace_hygiene_block}
 Tasks, in order:
 
-1. Correctness gate:
+1. Correctness + measurement gate:
    - If `{validation_level}=quick`, run `quick_command` against the
-     representative shapes.
-   - If `{validation_level}=full`, run `test_command` followed by
-     `benchmark_command` across all target shapes.
-   All shapes must pass; if any fails, record `correctness_ok=false` and
-   stop (Python will trigger rollback).
-2. Collect the benchmark CSV (if produced) at
-   `{campaign_dir}/rounds/round-{round_n}/artifacts/benchmark.csv`. Use
-   `mv` to relocate any CSV the benchmark command dumped in the working
-   directory (do NOT `cp`, see <workspace_hygiene>). Save raw
-   stdout/stderr to `benchmark.log` in the same folder.
-3. Use `mcp__turbo__parse_bench_csv` to produce a structured score vector
-   and aggregate score. Do NOT hand-aggregate; rely on the MCP tool.
+     representative shapes. Invoke the quick bench script with
+     `--summary-csv {campaign_dir}/rounds/round-{round_n}/artifacts/benchmark.csv`
+     so the canonical CSV lands in the right place. Save combined
+     stdout+stderr to `benchmark.log` in the same folder.
+   - If `{validation_level}=full`, first run `test_command` to confirm
+     correctness across the full test suite, then run
+     `benchmark_command` across all target shapes (save its output to
+     `full_benchmark.csv` / `full_benchmark.log`). After the full
+     sweep, ALSO run `quick_command` once with the same
+     `--summary-csv` pointing at `benchmark.csv` so the authoritative
+     score is produced by the same harness BASELINE used.
+   All shapes in the quick bench MUST PASS; if any check fails, record
+   `correctness_ok=false` and stop (Python will trigger rollback).
+2. Relocate any stray CSVs the benchmark commands dumped in the working
+   directory into the artifacts folder using `mv` (do NOT `cp`, see
+   <workspace_hygiene>). After step 1 the folder must contain at least:
+   - `benchmark.csv` — authoritative, quick-harness schema, one row per
+     representative shape.
+   - `benchmark.log` — combined stdout/stderr of the quick bench.
+   and for `{validation_level}=full`:
+   - `full_benchmark.csv` / `full_benchmark.log` — archival full sweep
+     (not parsed for scoring).
+3. Use `mcp__turbo__parse_bench_csv` to parse `benchmark.csv` ONLY.
+   Never hand-aggregate and never substitute the full-sweep CSV: using
+   a different CSV across rounds breaks the methodology contract
+   above.
 4. Write `{campaign_dir}/rounds/round-{round_n}/summary.md` using the
    Round Summary Template from the skill excerpt. Populate:
    - Hypothesis / Single change (from ANALYZE + OPTIMIZE outputs)

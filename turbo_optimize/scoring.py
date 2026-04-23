@@ -115,6 +115,162 @@ def _parse_float(raw: Any) -> float:
         return float("nan")
 
 
+# Schema normalization -------------------------------------------------
+#
+# Primus-Turbo campaigns traditionally emit two very different CSVs:
+#
+# 1. Full benchmark (``benchmark_command``) — canonical columns
+#    ``Check``, ``Forward TFLOPS``, ``Backward TFLOPS``, optional
+#    ``Forward Time (ms)`` / ``Backward Time (ms)``, plus shape
+#    columns ``B, M, N, K, Case, Dtype, Granularity``. One row per
+#    target shape (hundreds of rows for a full sweep).
+# 2. Quick bench (``quick_command`` → ``quick_test_bench.py``) —
+#    ``correct`` (True/False), ``fwd_tflops_mean``, ``fwd_tflops_std``,
+#    ``bwd_tflops_mean``, ``bwd_tflops_std``, ``label, B, M, N, K``.
+#    One row per representative shape.
+#
+# Both layouts describe the same underlying measurement. The scorer
+# requires a single canonical schema so BASELINE (run via either
+# harness) and the per-round VALIDATE (always run via the quick
+# harness) compute the **same** aggregate over the **same** shapes.
+# Without normalization the column lookup silently returns NaN for the
+# quick schema, the per-shape regression gate never finds matching
+# shapes, and the trend rows end up using different numbers across
+# rounds — exactly the measurement-consistency failure described in
+# ``docs/performance-measurement-confidence.md``.
+#
+# The rules below are intentionally narrow: they only rename columns
+# for which the canonical name is absent, so a genuinely canonical CSV
+# passes through unchanged and cannot accidentally be double-renamed.
+
+
+_CANONICAL_COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+    # canonical_name: (alias1, alias2, ...)
+    "Check": ("Check", "correct", "check", "check_pass", "correctness"),
+    "Forward TFLOPS": (
+        "Forward TFLOPS",
+        "fwd_tflops_mean",
+        "forward_tflops_mean",
+        "fwd_tflops",
+    ),
+    "Backward TFLOPS": (
+        "Backward TFLOPS",
+        "bwd_tflops_mean",
+        "backward_tflops_mean",
+        "bwd_tflops",
+    ),
+    "Forward Time (ms)": (
+        "Forward Time (ms)",
+        "fwd_ms_mean",
+        "forward_ms_mean",
+        "fwd_ms",
+    ),
+    "Backward Time (ms)": (
+        "Backward Time (ms)",
+        "bwd_ms_mean",
+        "backward_ms_mean",
+        "bwd_ms",
+    ),
+}
+
+_CANONICAL_STDDEV_ALIASES: dict[str, tuple[str, ...]] = {
+    # canonical_metric -> alias columns that describe its stddev
+    # (absolute units; the parser converts to percentage using the
+    # row's mean). All aliases are appended with the canonical
+    # ``_stddev`` suffix in the normalised row so the downstream
+    # ``_stddev_header_for`` lookup finds them.
+    "Forward TFLOPS": ("Forward TFLOPS_stddev", "fwd_tflops_std", "forward_tflops_std"),
+    "Backward TFLOPS": ("Backward TFLOPS_stddev", "bwd_tflops_std", "backward_tflops_std"),
+    "Forward Time (ms)": ("Forward Time (ms)_stddev", "fwd_ms_std", "forward_ms_std"),
+    "Backward Time (ms)": ("Backward Time (ms)_stddev", "bwd_ms_std", "backward_ms_std"),
+}
+
+
+_BOOLEAN_PASS_VALUES = {"true", "1", "yes", "y", "pass", "passed", "ok"}
+_BOOLEAN_FAIL_VALUES = {"false", "0", "no", "n", "fail", "failed"}
+
+
+def _build_alias_rewrite(headers: list[str]) -> tuple[dict[str, str], list[str]]:
+    """Return ``(old_to_new, canonical_headers)`` for column normalisation.
+
+    * ``old_to_new`` maps every non-canonical alias to its canonical
+      target, including stddev companions. Canonical columns map to
+      themselves so the rewritten row dict preserves them as-is.
+    * ``canonical_headers`` is the fully-rewritten header list used by
+      the downstream shape-column / stddev-column detectors.
+
+    Columns that are neither metric aliases nor canonical names (shape
+    columns, ``repeats``, ``label``, ``TestID`` etc.) pass through
+    unchanged.
+    """
+    present = set(headers)
+    old_to_new: dict[str, str] = {}
+
+    def _first_alias_in(aliases: tuple[str, ...]) -> str | None:
+        for alias in aliases:
+            if alias in present:
+                return alias
+        return None
+
+    for canonical, aliases in _CANONICAL_COLUMN_ALIASES.items():
+        if canonical in present:
+            old_to_new[canonical] = canonical
+            continue
+        match = _first_alias_in(aliases)
+        if match is not None:
+            old_to_new[match] = canonical
+
+    for canonical_metric, aliases in _CANONICAL_STDDEV_ALIASES.items():
+        canonical_std = f"{canonical_metric}_stddev"
+        if canonical_std in present:
+            old_to_new[canonical_std] = canonical_std
+            continue
+        match = _first_alias_in(aliases)
+        if match is not None:
+            old_to_new[match] = canonical_std
+
+    canonical_headers: list[str] = []
+    for header in headers:
+        canonical_headers.append(old_to_new.get(header, header))
+    return old_to_new, canonical_headers
+
+
+def _rewrite_row(raw: dict[str, Any], rewrite: dict[str, str]) -> dict[str, Any]:
+    """Return a row dict whose keys are the canonical names."""
+    if not rewrite:
+        return dict(raw)
+    out: dict[str, Any] = {}
+    for key, value in raw.items():
+        canonical = rewrite.get(key, key)
+        if canonical == "Check":
+            out[canonical] = _normalise_check_value(value)
+        else:
+            out[canonical] = value
+    return out
+
+
+def _normalise_check_value(value: Any) -> str:
+    """Map quick-bench ``correct=True/False`` values to the canonical
+    ``PASS`` / ``FAIL`` strings the scorer expects.
+
+    Non-string canonical values (``"PASS"`` / ``"FAIL"`` etc.) pass
+    through untouched; unknown strings are upper-cased so downstream
+    ``str(raw.get(CHECK_COL, "")).strip().upper()`` works identically
+    to the unpatched path.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "PASS" if value else "FAIL"
+    text = str(value).strip()
+    low = text.lower()
+    if low in _BOOLEAN_PASS_VALUES:
+        return "PASS"
+    if low in _BOOLEAN_FAIL_VALUES:
+        return "FAIL"
+    return text
+
+
 def parse_bench_csv(path: Path, primary_metric: str) -> BenchmarkParse:
     """Parse a benchmark CSV. Assumes headers plus one row per shape.
 
@@ -125,6 +281,16 @@ def parse_bench_csv(path: Path, primary_metric: str) -> BenchmarkParse:
     back to the hard-coded noise threshold only when no column matches.
     ``_stddev`` / ``_std`` columns are normalised into percentages using
     the metric's mean in the same row.
+
+    To guarantee BASELINE and VALIDATE measure the *same* thing, the
+    parser transparently normalises alternative column names emitted
+    by ``quick_test_bench.py`` (``fwd_tflops_mean``, ``correct``,
+    ``fwd_tflops_std`` ...) into the canonical Primus-Turbo schema
+    (``Forward TFLOPS``, ``Check``, ``Forward TFLOPS_stddev`` ...).
+    ``BenchmarkParse.raw_headers`` always reports the post-rewrite
+    header list so downstream consumers can discover which columns the
+    scorer actually saw. See :data:`_CANONICAL_COLUMN_ALIASES` for the
+    full alias table.
     """
     metrics = split_primary_metric(primary_metric)
     if not path.exists():
@@ -134,24 +300,27 @@ def parse_bench_csv(path: Path, primary_metric: str) -> BenchmarkParse:
         reader = csv.DictReader(f)
         if reader.fieldnames is None:
             raise ScoringError(f"CSV has no header: {path}")
-        headers = list(reader.fieldnames)
-        shape_cols = _detect_shape_columns(headers, metrics)
+        raw_headers = list(reader.fieldnames)
+        rewrite, canonical_headers = _build_alias_rewrite(raw_headers)
+        shape_cols = _detect_shape_columns(canonical_headers, metrics)
         stddev_columns = {
-            metric: _stddev_header_for(metric, headers) for metric in metrics
+            metric: _stddev_header_for(metric, canonical_headers)
+            for metric in metrics
         }
-        has_repeats_col = "repeats" in headers
+        has_repeats_col = "repeats" in canonical_headers
         rows: list[ShapeResult] = []
         all_pass = True
         for raw in reader:
+            row = _rewrite_row(raw, rewrite)
             metrics_in_row: dict[str, float] = {}
             stddev_in_row: dict[str, float] = {}
             for metric in metrics:
-                mean_val = _parse_float(raw.get(metric))
+                mean_val = _parse_float(row.get(metric))
                 metrics_in_row[metric] = mean_val
                 std_col = stddev_columns.get(metric)
                 if std_col is None:
                     continue
-                std_val = _parse_float(raw.get(std_col))
+                std_val = _parse_float(row.get(std_col))
                 if math.isnan(std_val):
                     continue
                 if std_col.endswith(("_stddev", "_std")):
@@ -159,18 +328,18 @@ def parse_bench_csv(path: Path, primary_metric: str) -> BenchmarkParse:
                         stddev_in_row[metric] = std_val / mean_val * 100.0
                 else:
                     stddev_in_row[metric] = std_val
-            check = str(raw.get(CHECK_COL, "")).strip().upper() or "UNKNOWN"
+            check = str(row.get(CHECK_COL, "")).strip().upper() or "UNKNOWN"
             if check != "PASS":
                 all_pass = False
             repeats = 1
             if has_repeats_col:
                 try:
-                    repeats = max(1, int(float(raw.get("repeats", 1) or 1)))
+                    repeats = max(1, int(float(row.get("repeats", 1) or 1)))
                 except (TypeError, ValueError):
                     repeats = 1
             rows.append(
                 ShapeResult(
-                    shape={col: raw.get(col) for col in shape_cols},
+                    shape={col: row.get(col) for col in shape_cols},
                     check=check,
                     metrics=metrics_in_row,
                     metrics_stddev_pct=stddev_in_row,
@@ -178,7 +347,10 @@ def parse_bench_csv(path: Path, primary_metric: str) -> BenchmarkParse:
                 )
             )
     return BenchmarkParse(
-        primary_metric=metrics, rows=rows, all_pass=all_pass, raw_headers=headers
+        primary_metric=metrics,
+        rows=rows,
+        all_pass=all_pass,
+        raw_headers=canonical_headers,
     )
 
 
@@ -191,12 +363,29 @@ def _detect_shape_columns(headers: Iterable[str], metrics: Iterable[str]) -> lis
     companion_cols.add("repeats")
     exclude = metric_set | {CHECK_COL} | companion_cols
     exclude |= {h for h in headers if _looks_like_metric(h) and h not in metric_set}
+    exclude |= {h for h in headers if _looks_like_noise_column(h)}
     return [h for h in headers if h not in exclude]
 
 
 def _looks_like_metric(header: str) -> bool:
     keywords = ("TFLOPS", "TOPS", "GB/s", "ms", "latency", "Bandwidth")
     return any(k.lower() in header.lower() for k in keywords)
+
+
+def _looks_like_noise_column(header: str) -> bool:
+    """True for columns that vary run-to-run even for a fixed shape.
+
+    The scorer builds per-row shape keys from the columns returned by
+    :func:`_detect_shape_columns`. Correctness-signal columns (SNR
+    values, random-seed diagnostics) must be excluded from that key
+    set or round-N's shape keys never match round-1's — even though
+    the underlying shape is identical. Matching by substrings here
+    keeps the check permissive enough to absorb future column names
+    (``out_snr_fwd`` / ``grad_snr_bwd`` ...).
+    """
+    low = header.lower()
+    noise_markers = ("snr",)
+    return any(marker in low for marker in noise_markers)
 
 
 def compute_score_vector(parse: BenchmarkParse) -> ScoreVector:
@@ -289,6 +478,114 @@ def find_per_shape_regressions(
 
 def _shape_key(shape: dict[str, Any]) -> tuple:
     return tuple(sorted((str(k), str(v)) for k, v in shape.items()))
+
+
+# Shape-identity helpers ------------------------------------------------
+#
+# BASELINE and VALIDATE are only comparable when they run the same
+# shapes with the same schema. Each shape dict mixes semantic shape
+# axes (``B, M, N, K``) with bookkeeping columns (``label``, ``Case``,
+# ``TestID``, ``Platform``, ...). Matching by the full shape dict makes
+# round-N reject shapes that BASELINE labelled with a different ``Case``
+# name, even though the underlying ``B/M/N/K`` are identical. The
+# geometry-only key below fixes that by keeping only the canonical
+# numeric shape axes.
+
+
+_SHAPE_AXIS_CANDIDATES: tuple[str, ...] = (
+    "B",
+    "M",
+    "N",
+    "K",
+    "D",
+    "H",
+    "W",
+    "seq_len",
+    "num_heads",
+    "num_kv_heads",
+    "head_dim",
+)
+
+
+def _geometry_key(shape: dict[str, Any]) -> tuple:
+    """Return a shape key based on numeric axes only.
+
+    Uses :data:`_SHAPE_AXIS_CANDIDATES` as a priority list; missing
+    axes are skipped so partial matches (``{M, N, K}`` when BASELINE
+    only records those three) still work. Falls back to the full shape
+    dict when none of the canonical axes are present — this preserves
+    behaviour for exotic ops whose shape columns we don't yet know.
+    """
+    hits: list[tuple[str, str]] = []
+    for axis in _SHAPE_AXIS_CANDIDATES:
+        if axis in shape and shape[axis] is not None and shape[axis] != "":
+            hits.append((axis, str(shape[axis])))
+    if hits:
+        return tuple(hits)
+    return _shape_key(shape)
+
+
+@dataclass
+class ShapeConsistencyReport:
+    """Outcome of comparing a candidate vector's shape set against the
+    baseline.
+
+    * ``consistent`` — True when every candidate shape has a matching
+      geometry key in the baseline (extra baseline shapes are
+      permitted; the baseline may run a broader sweep).
+    * ``candidate_only`` / ``baseline_only`` — the geometry keys that
+      appear on only one side. Rendered into the orchestrator warning
+      so operators can see exactly which shapes drifted.
+    * ``mismatch_reason`` — human-readable message when
+      ``consistent=False``; empty when everything matches.
+    """
+
+    consistent: bool
+    candidate_only: list[tuple]
+    baseline_only: list[tuple]
+    mismatch_reason: str = ""
+
+
+def verify_shape_consistency(
+    candidate: ScoreVector | None,
+    baseline: ScoreVector | None,
+) -> ShapeConsistencyReport:
+    """Check whether ``candidate`` shapes are a subset of ``baseline``.
+
+    Returns :class:`ShapeConsistencyReport`. A ``None`` vector on
+    either side is treated as "unknown" and yields an inconclusive but
+    consistent report — callers should only surface warnings when
+    ``consistent=False``. Comparison uses :func:`_geometry_key` so a
+    rename from ``DSV3-GateUP-sm`` (quick bench ``label``) to
+    ``DeepSeek-V3-GateUP`` (full bench ``Case``) does not produce a
+    false mismatch.
+    """
+    if candidate is None or baseline is None:
+        return ShapeConsistencyReport(
+            consistent=True,
+            candidate_only=[],
+            baseline_only=[],
+            mismatch_reason="",
+        )
+    cand_keys = {_geometry_key(row.shape) for row in candidate.per_shape}
+    base_keys = {_geometry_key(row.shape) for row in baseline.per_shape}
+    cand_only = sorted(cand_keys - base_keys)
+    base_only = sorted(base_keys - cand_keys)
+    consistent = not cand_only
+    reason = ""
+    if not consistent:
+        reason = (
+            f"candidate contains {len(cand_only)} shape(s) absent from the "
+            f"baseline — measurements are not directly comparable. "
+            f"Unmatched candidate keys: {cand_only[:3]}"
+            + (" ..." if len(cand_only) > 3 else "")
+        )
+    return ShapeConsistencyReport(
+        consistent=consistent,
+        candidate_only=cand_only,
+        baseline_only=base_only,
+        mismatch_reason=reason,
+    )
 
 
 def decide_accept_rollback(

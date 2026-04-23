@@ -101,12 +101,48 @@ Tasks, in order:
    template from the project skill's "Quick validation" section. Leave
    `SHAPES` as an empty placeholder list (BASELINE will fill it).
 
-   The generated script MUST expose a `--repeats N` CLI flag (default 3)
-   and report every metric as `mean ± std` across those repeats. Use
-   `torch.cuda.synchronize()` around each timed block and drop the first
-   repeat as a warm-up. Emit both a machine-readable CSV with per-repeat
-   rows AND a one-line summary per shape — downstream parsing depends
-   on the variance column being present even when `--repeats 1`.
+   The generated script MUST expose:
+   - `--repeats N` (default 3, first repeat is warm-up and dropped);
+   - `--iters-per-repeat M` (default 50, inner iterations per repeat);
+   - `--csv PATH` (optional per-repeat CSV);
+   - `--summary-csv PATH` (per-shape mean/std CSV — **authoritative** for
+     BASELINE and every VALIDATE round).
+
+   `--summary-csv` MUST write a CSV whose columns match the canonical
+   Primus-Turbo schema so `mcp__turbo__parse_bench_csv` consumes it
+   identically to the full benchmark output. The canonical schema is:
+
+       label,B,M,N,K,Check,Forward TFLOPS,Forward TFLOPS_stddev,Backward TFLOPS,Backward TFLOPS_stddev,Forward Time (ms),Backward Time (ms),out_snr,da_snr,db_snr
+
+   * `Check` is the string `PASS` when SNR thresholds hold on every
+     output/gradient and the benchmark timing path did not raise;
+     otherwise `FAIL`.
+   * `Forward TFLOPS` / `Backward TFLOPS` are the mean across the
+     (non-warm-up) repeats, computed from forward/backward FLOPs and
+     wall time. `Forward TFLOPS_stddev` / `Backward TFLOPS_stddev` are
+     the absolute stddev in TFLOPS — the scorer converts to % using
+     the mean.
+   * `Forward Time (ms)` / `Backward Time (ms)` are the mean ms and
+     exist so the same parser also handles time-first primary metrics.
+   * `out_snr` / `da_snr` / `db_snr` are correctness diagnostics; the
+     scorer ignores them for aggregation but they are useful for
+     offline noise analysis.
+
+   Implementation rules inside the script:
+
+   - Use `torch.cuda.synchronize()` around each timed block. The
+     simplest correct pattern is `sync; t0 = time.perf_counter(); for
+     _ in range(iters): fn(); sync; mean_ms = (time.perf_counter() -
+     t0) / iters * 1000`.
+   - Drop the first repeat as a warm-up; `total_repeats = max(2,
+     repeats + 1)`.
+   - Always emit `--summary-csv` rows even when `SHAPES` is empty or a
+     shape errors out — write the row with `Check=FAIL` and the metric
+     columns set to `NaN` so BASELINE's MCP parse sees the failure
+     instead of a silently missing row.
+   - Seed PyTorch once per shape (`torch.manual_seed(0)` before each
+     tensor allocation) so measurement noise does not alternate with
+     activation-magnitude noise between rounds.
 6. Generate `{campaign_dir}/profile_op_shape.py`, a tiny helper that
    profiles the current kernel on one representative shape via
    `rocprofv3 --kernel-trace` and `rocprof-compute profile`. The script

@@ -59,10 +59,13 @@ from turbo_optimize.scoring import (
     BenchmarkParse,
     DecisionResult,
     ScoreVector,
+    ScoringError,
     ShapeResult,
     check_hypothesis_duplicate,
     decide_accept_rollback,
+    parse_bench_csv,
     split_primary_metric,
+    verify_shape_consistency,
 )
 from turbo_optimize.signals import (
     GracefulStop,
@@ -1044,6 +1047,26 @@ def _apply_decision(
     if state.best_round is not None and state.best_score:
         best = ScoreVector(per_shape=best_vector, aggregate=state.best_score)
 
+    report = verify_shape_consistency(candidate, best)
+    if not report.consistent:
+        log.warning(
+            "round-%d shape-consistency warning: %s; candidate-only=%s "
+            "baseline-only=%s. The per-shape regression gate only considers "
+            "overlapping shapes — audit the bench harness if this persists.",
+            round_n,
+            report.mismatch_reason,
+            report.candidate_only[:5],
+            report.baseline_only[:5],
+        )
+    elif report.baseline_only and candidate.per_shape:
+        log.info(
+            "round-%d baseline measured %d extra shape(s) not in candidate: "
+            "%s (acceptable — baseline may run a wider sweep).",
+            round_n,
+            len(report.baseline_only),
+            report.baseline_only[:5],
+        )
+
     decision = decide_accept_rollback(
         candidate,
         best,
@@ -1571,20 +1594,45 @@ def _build_score_vector(rows: Any, primary_metric: str) -> list[ShapeResult]:
 
 
 def _history_best_score_vector(params: CampaignParams) -> list[dict]:
+    """Return the BASELINE per-shape score vector, parsed from round-1's CSV.
+
+    The previous implementation built ``{"shape": {}, ...}`` entries
+    directly from the raw row dict, which collapsed every shape into
+    the same empty geometry key and exposed shape columns (``B, M, N,
+    K``) as if they were metrics. That broke the per-shape regression
+    gate silently: ``find_per_shape_regressions`` saw one lookup entry
+    for the whole baseline, so no candidate shape ever matched and no
+    regression could ever be detected.
+
+    We now route the read through :func:`parse_bench_csv` so the
+    returned rows honour the canonical schema (``Forward TFLOPS`` /
+    ``Backward TFLOPS``, PASS / FAIL, geometry-only shape dict) and
+    the alias normaliser — meaning a BASELINE CSV produced by either
+    the full ``benchmark_command`` harness or the quick
+    ``quick_command`` harness is picked up identically. This is the
+    guarantee that makes the per-round comparison methodologically
+    consistent with the rules documented in
+    ``docs/performance-measurement-confidence.md``.
+    """
     if params.campaign_dir is None:
         return []
     path = params.campaign_dir / "rounds" / "round-1" / "artifacts" / "benchmark.csv"
     if not path.exists():
         return []
     try:
-        import csv as _csv
-    except ImportError:
+        parse = parse_bench_csv(path, params.primary_metric or "")
+    except ScoringError as exc:
+        log.warning("could not parse baseline CSV %s: %s", path, exc)
         return []
     rows: list[dict] = []
-    with path.open("r", encoding="utf-8", newline="") as f:
-        reader = _csv.DictReader(f)
-        for raw in reader:
-            rows.append({"shape": {}, "check": raw.get("Check", "PASS"), "metrics": raw})
+    for row in parse.rows:
+        rows.append(
+            {
+                "shape": dict(row.shape),
+                "check": row.check,
+                "metrics": dict(row.metrics),
+            }
+        )
     return rows
 
 

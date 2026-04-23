@@ -12,6 +12,10 @@ cd "$REPO_ROOT"
 if [ ! -d "$DEST/.git" ]; then
   mkdir -p "$(dirname "$DEST")"
   git clone --branch "$BRANCH" "$REPO_URL" "$DEST"
+  cd "$DEST"
+  git submodule init
+  git submodule update
+  cd "$REPO_ROOT"
 else
   git -C "$DEST" fetch origin "$BRANCH"
   git -C "$DEST" checkout "$BRANCH"

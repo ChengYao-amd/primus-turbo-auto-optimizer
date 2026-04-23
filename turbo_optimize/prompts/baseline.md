@@ -17,36 +17,77 @@ Round directory:    `{campaign_dir}/rounds/round-1/`
 Structured output:  `{phase_result_path}`
 
 {workspace_hygiene_block}
+## Measurement-consistency contract
+
+Every per-round VALIDATE reads one CSV from
+`rounds/round-N/artifacts/benchmark.csv` and compares it shape-by-shape
+against round-1's version at
+`rounds/round-1/artifacts/benchmark.csv`. For that comparison to be
+methodologically sound the two CSVs MUST:
+
+* contain the **same set of representative shapes** (identical `B/M/N/K`),
+* use the **same benchmark harness** (`manifest.quick_command`), and
+* follow the **same CSV schema** (so `mcp__turbo__parse_bench_csv`
+  parses them identically).
+
+BASELINE therefore does NOT use `benchmark_command` output as the
+authoritative score source. That full sweep still runs — it is the
+coverage gate and the shape picker — but its CSV lives under
+`full_benchmark.csv` and is only referenced from the structured output
+via `reference_benchmark_csv`. The per-round-comparable CSV is always
+the quick bench.
+
 Tasks (strict order):
 
 1. Run the focused test command from `manifest.test_command`. All tests
    MUST pass. If any fails, stop, record the failure reason in the JSON
    output (`test_pass=false`) and do NOT proceed to benchmarking.
-2. Run the focused benchmark command from `manifest.benchmark_command`.
+2. Run the focused benchmark command from `manifest.benchmark_command`
+   as the **coverage sweep** used only to pick representative shapes.
    Capture stdout / stderr to
-   `{campaign_dir}/rounds/round-1/artifacts/benchmark.log`. If the
-   project emits a CSV next to the current working directory, `mv` it
-   to `{campaign_dir}/rounds/round-1/artifacts/benchmark.csv` (do NOT
-   `cp` — see <workspace_hygiene>).
-3. Parse the benchmark output per `manifest.primary_metric`. Compute the
-   aggregate score (geometric mean of primary_metric across all PASS
-   shapes) and a score vector (per-shape metrics).
-4. Select 3-5 representative shapes covering small / medium / large
-   behaviour from the PASS rows. These will drive `quick_command`.
-5. Update the two files that must stay in sync with the chosen
+   `{campaign_dir}/rounds/round-1/artifacts/full_benchmark.log`.
+   If the project emits a CSV next to the current working directory,
+   `mv` it to
+   `{campaign_dir}/rounds/round-1/artifacts/full_benchmark.csv` (do NOT
+   `cp` — see <workspace_hygiene>). This CSV will NOT drive the
+   aggregate score or the trend row; it is archival + reference only.
+3. Select 3-5 representative shapes covering small / medium / large
+   behaviour from the PASS rows of `full_benchmark.csv`. These will
+   drive `quick_command` and every subsequent per-round measurement.
+4. Update the two files that must stay in sync with the chosen
    representative shapes:
    - `{campaign_dir}/quick_test_bench.py`: replace the empty `SHAPES`
      placeholder with the list you selected.
    - `{campaign_dir}/manifest.yaml`: set `representative_shapes` to the
      same list. Do not modify any other field unless explicitly required.
-6. Run `manifest.quick_command` once against the freshly filled
-   `representative_shapes`. Redirect the combined stdout+stderr to
-   `{campaign_dir}/rounds/round-1/artifacts/quick_baseline.log`
-   (append with `2>&1 | tee` or shell redirection; do NOT truncate
-   after the fact). All shapes must PASS; if any check fails, stop
-   the phase, emit `test_pass=false` in the JSON output, and leave
-   `quick_baseline_log` set to the partial log path. Every later
-   VALIDATE quick round will diff its own run against this reference.
+5. Run `manifest.quick_command` once against the freshly filled
+   `representative_shapes` and MAKE IT EMIT THE AUTHORITATIVE CSV.
+   The quick bench script MUST be invoked with a `--summary-csv`
+   argument pointing at
+   `{campaign_dir}/rounds/round-1/artifacts/benchmark.csv`. The
+   script's combined stdout+stderr go to
+   `{campaign_dir}/rounds/round-1/artifacts/quick_baseline.log` (use
+   `2>&1 | tee` or shell redirection; do NOT truncate after the
+   fact). Example:
+
+       python {campaign_dir}/quick_test_bench.py \
+         --summary-csv {campaign_dir}/rounds/round-1/artifacts/benchmark.csv \
+         --csv {campaign_dir}/rounds/round-1/artifacts/benchmark_per_repeat.csv \
+         2>&1 | tee {campaign_dir}/rounds/round-1/artifacts/quick_baseline.log
+
+   The `--summary-csv` output is the single source of truth for the
+   BASELINE aggregate and for the per-shape regression gate in every
+   future VALIDATE. All shapes in this run MUST PASS; if any
+   correctness check fails, stop, emit `test_pass=false`, and leave
+   `quick_baseline_log` / `benchmark_csv` set to the partial paths so
+   the failure is debuggable.
+6. Parse `rounds/round-1/artifacts/benchmark.csv` via
+   `mcp__turbo__parse_bench_csv` (DO NOT hand-aggregate). Use the
+   returned `aggregate` and `rows` to populate `aggregate_score`,
+   `score_vector`, and `trend_row` in the JSON output below. This is
+   the **same tool** VALIDATE calls each round, which is how we
+   guarantee identical geomean formulas, identical shape keys, and
+   identical stddev interpretation across round-1 and round-N.
 7. Write `{campaign_dir}/rounds/round-1/summary.md` using the canonical
    round-summary template from the skill excerpt. Round-1's `Single
    change` block must explicitly say "No code change. Baseline round."
@@ -67,6 +108,7 @@ Tasks (strict order):
 {{
   "test_pass": true_or_false,
   "benchmark_csv": "rounds/round-1/artifacts/benchmark.csv",
+  "reference_benchmark_csv": "rounds/round-1/artifacts/full_benchmark.csv",
   "quick_baseline_log": "rounds/round-1/artifacts/quick_baseline.log",
   "primary_metric": "{primary_metric}",
   "aggregate_score": {{
@@ -91,6 +133,11 @@ Tasks (strict order):
   "notes": "<short>"
 }}
 ```
+
+`benchmark_csv` MUST point at the quick-harness CSV produced in step
+5; `reference_benchmark_csv` points at the full-sweep CSV from step 2.
+`aggregate_score` / `score_vector` / `trend_row` are always computed
+from `benchmark_csv`, never from the full sweep.
 
 Populate both Forward and Backward TFLOPS when the kernel has a backward
 path. For inference-only kernels, set the Backward fields to `null` — the
