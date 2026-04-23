@@ -30,7 +30,8 @@ turbo_optimize/
     run_phase.py         ClaudeAgentOptions 统一构造 + 流式执行
     phases/*.py          每个 phase 的 run() 协程
     campaign.py          主状态机、轮次执行、决策落盘、termination 检查
-agent_workspace/Primus-Turbo/   Primus-Turbo submodule（优化对象）
+agent_workspace/Primus-Turbo/    Primus-Turbo 工作目录（由 scripts/sync_primus_turbo.sh 拉取最新 main，本仓库不跟踪）
+scripts/sync_primus_turbo.sh     从 git@github.com:AMD-AGI/Primus-Turbo.git 克隆或 reset 到 origin/<branch>
 docs/                            设计文档
 tests/                           pytest 冒烟测试
 ```
@@ -38,17 +39,16 @@ tests/                           pytest 冒烟测试
 ## 环境要求
 
 - Python 3.10+
-- 能 clone `git@github.com:AMD-AGI/Primus-Turbo.git` 的凭据（submodule）
+- 能 clone `git@github.com:AMD-AGI/Primus-Turbo.git` 的 SSH 凭据（由 `scripts/sync_primus_turbo.sh` 使用）
 - 如需真实跑优化循环：Claude 凭据（`ANTHROPIC_API_KEY` 或自建 gateway），以及 Primus-Turbo 所需的 GPU / ROCm / PyTorch / Triton 环境。冒烟测试本身不需要 Claude 凭据或 GPU。
 
 ## 安装
 
 ```bash
-git clone --recurse-submodules <this-repo-url>
+git clone <this-repo-url>
 cd primus-turbo-auto-optimizer
 
-# 已经 clone 过但没拉 submodule：
-git submodule update --init --recursive
+bash scripts/sync_primus_turbo.sh
 
 pip install -e '.[dev]'
 ```
@@ -62,6 +62,28 @@ pip install -e '.[dev]'
 primus-turbo-optimize --version
 primus-turbo-optimize --help
 ```
+
+### 同步 Primus-Turbo 源码
+
+`agent_workspace/Primus-Turbo/` 不是 git submodule，而是由 `scripts/sync_primus_turbo.sh` 独立维护的克隆目录；本仓库在 `.gitignore` 里忽略它，因此不会把 Primus-Turbo 的 commit SHA 固化到父仓库。
+
+脚本行为：目录不存在时 `git clone --branch <BRANCH>`；已存在时 `git fetch` + `git checkout <BRANCH>` + `git reset --hard origin/<BRANCH>`。默认分支 `main`，可通过环境变量覆盖：
+
+```bash
+# 默认：拉 origin/main 最新
+bash scripts/sync_primus_turbo.sh
+
+# 切换到其他分支（举一个例子，联调 dev/agent）
+PRIMUS_TURBO_BRANCH=dev/agent bash scripts/sync_primus_turbo.sh
+
+# 改用别的 URL（例如 fork / 镜像）
+PRIMUS_TURBO_URL=git@github.com:<your-fork>/Primus-Turbo.git \
+  bash scripts/sync_primus_turbo.sh
+```
+
+想象下面的使用场景帮助理解：每次进入容器重建环境，先跑一次 sync 脚本就能拿到 Primus-Turbo 最新主分支，父仓库无需任何 `git submodule` 操作，也不会再出现 "upload-pack: not our ref" 这类子模块 SHA 丢失的问题。
+
+注意 `reset --hard` 会覆盖 `agent_workspace/Primus-Turbo/` 里任何本地未提交改动，本地有 WIP 请先在 Primus-Turbo 目录里 `git stash` 或换分支保存。
 
 ### 关于 venv
 
