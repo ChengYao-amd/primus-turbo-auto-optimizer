@@ -55,14 +55,13 @@ Tasks (strict order):
    `{campaign_dir}/rounds/round-1/kernel_snapshot/` — note the trailing
    `/` so `cp` treats the destination as a directory (PREPARE_ENVIRONMENT
    may have done this already; verify and repair if missing).
-9. Append a baseline block to `{campaign_dir}/logs/optimize.md` using the
-   "Baseline record template" from the skill excerpt (do NOT rewrite any
-   existing content; append only). The orchestrator will also append a
-   `Quick baseline log:` line based on the `quick_baseline_log` field in
-   the JSON output below, so you do not need to duplicate that line.
-10. Append the first row to `{campaign_dir}/logs/performance_trend.md`
-    using the Rule 8 table format (status `BASELINE`, vs baseline `—`).
-11. Emit the structured phase result at `{phase_result_path}`:
+9. Do NOT touch `{campaign_dir}/logs/optimize.md` or
+   `{campaign_dir}/logs/performance_trend.md` in this phase. The
+   orchestrator owns both files end-to-end: the BASELINE block in
+   `optimize.md` and the BASELINE row in `performance_trend.md` are
+   both written by Python from the JSON below, so any manual edit
+   here would collide and produce duplicate / inconsistent rows.
+10. Emit the structured phase result at `{phase_result_path}`:
 
 ```json
 {{

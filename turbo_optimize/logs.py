@@ -55,6 +55,135 @@ def _append(path: Path, text: str) -> None:
         f.write(text)
 
 
+# --- section-scoped editors --------------------------------------------
+#
+# ``optimize.md`` is seeded from :data:`OPTIMIZE_HEADER_TEMPLATE` with a
+# fixed set of ``## <section>`` headings (Baseline / Optimization History
+# / Current Best / Directions to Try / Verified Ineffective Directions /
+# Final Report). Early versions of the helpers below used plain
+# :func:`_append`, which dropped every new entry at EOF and left the
+# template sections empty. Readers and dedup parsers that look inside
+# specific headings therefore saw nothing. The editors below locate the
+# owning heading and insert / upsert into its body, which both preserves
+# Rule 8's append-only intent inside each section and keeps the
+# rendered file structured.
+#
+# ``_split_section`` is the only place that has to know how a section
+# ends: we stop at the next ``## `` (two hashes + space) heading, which
+# skips ``### round-N`` and ``### Baseline Entry`` sub-headings.
+
+
+def _split_section(text: str, header: str) -> tuple[str, str, str]:
+    """Locate ``header`` and return ``(prefix, body, suffix)``.
+
+    * ``prefix`` ends at (and includes) the header line.
+    * ``body`` is everything between the header and the next ``## ``
+      heading — or EOF if this is the last top-level section.
+    * ``suffix`` starts at the next ``## `` heading (possibly empty).
+
+    Raises :class:`KeyError` when the exact header line is missing so
+    callers can fall back to EOF appends for old logs that predate the
+    structured template.
+    """
+    lines = text.splitlines(keepends=True)
+    start: int | None = None
+    for i, line in enumerate(lines):
+        if line.rstrip("\r\n") == header:
+            start = i
+            break
+    if start is None:
+        raise KeyError(header)
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        line = lines[j]
+        if line.startswith("## ") and not line.startswith("### "):
+            end = j
+            break
+    prefix = "".join(lines[: start + 1])
+    body = "".join(lines[start + 1 : end])
+    suffix = "".join(lines[end:])
+    return prefix, body, suffix
+
+
+def _normalize_body(body: str, *, has_suffix: bool) -> str:
+    """Ensure the body ends with exactly one trailing blank line when it
+    is followed by another ``## `` section, or with a single newline at
+    EOF.
+    """
+    if not body:
+        return "\n" if has_suffix else ""
+    body = body.rstrip("\n") + "\n"
+    if has_suffix:
+        body += "\n"
+    return body
+
+
+def _strip_placeholder_lines(body: str, placeholders: set[str] | None) -> str:
+    if not placeholders:
+        return body
+    kept: list[str] = []
+    for line in body.splitlines(keepends=True):
+        if line.strip() in placeholders:
+            continue
+        kept.append(line)
+    return "".join(kept)
+
+
+def _upsert_section_body(
+    path: Path,
+    header: str,
+    new_body: str,
+    *,
+    fallback_append: str | None = None,
+) -> None:
+    """Replace the body of ``header`` with ``new_body``.
+
+    ``new_body`` should already contain trailing newlines; this helper
+    only normalizes the padding before the following ``## `` heading so
+    sections stay visually separated.
+    """
+    text = path.read_text(encoding="utf-8")
+    try:
+        prefix, _old, suffix = _split_section(text, header)
+    except KeyError:
+        if fallback_append is not None:
+            _append(path, fallback_append)
+        return
+    body = _normalize_body(new_body, has_suffix=bool(suffix))
+    path.write_text(prefix + body + suffix, encoding="utf-8")
+
+
+def _append_in_section(
+    path: Path,
+    header: str,
+    addition: str,
+    *,
+    placeholders: set[str] | None = None,
+    fallback_append: str | None = None,
+) -> None:
+    """Append ``addition`` inside the body of ``header``.
+
+    Lines in the existing body whose stripped form appears in
+    ``placeholders`` are dropped first, so the template's
+    ``_to be filled in…`` lines vanish the moment real content lands.
+    """
+    text = path.read_text(encoding="utf-8")
+    try:
+        prefix, body, suffix = _split_section(text, header)
+    except KeyError:
+        if fallback_append is not None:
+            _append(path, fallback_append)
+        else:
+            _append(path, addition)
+        return
+    body = _strip_placeholder_lines(body, placeholders)
+    if body and not body.endswith("\n"):
+        body += "\n"
+    combined = body + addition
+    combined = _normalize_body(combined, has_suffix=bool(suffix))
+    path.write_text(prefix + combined + suffix, encoding="utf-8")
+
+
 # --- optimize.md --------------------------------------------------------
 
 OPTIMIZE_HEADER_TEMPLATE = """# {target_op} {target_backend} Optimization Log
@@ -107,6 +236,11 @@ def init_optimize_log(campaign_dir: Path, params: dict[str, Any]) -> Path:
     return path
 
 
+BASELINE_PLACEHOLDER = "_to be filled in after round-1_"
+CURRENT_BEST_PLACEHOLDER = "_to be updated per accepted round_"
+FINAL_REPORT_PLACEHOLDER = "_filled in when campaign terminates_"
+
+
 def append_baseline(
     campaign_dir: Path,
     *,
@@ -118,19 +252,21 @@ def append_baseline(
     rounds_link: str = "rounds/round-1/summary.md",
     quick_baseline_log: str | None = None,
 ) -> None:
-    """Append a baseline note block; does not replace the existing header.
+    """Upsert the ``## Baseline`` section body.
 
-    ``quick_baseline_log`` is the campaign-relative path to the log file
-    emitted by BASELINE step 6 (running `manifest.quick_command` once against
-    the freshly-filled ``representative_shapes``). Passing ``None`` omits the
-    ``Quick baseline log:`` line entirely — useful when the phase bailed
-    before producing the log. Empty strings are treated the same as ``None``.
+    BASELINE runs once per campaign but `_phase_baseline` can be
+    re-entered (e.g. after resume) so we overwrite the body rather than
+    append — this removes the ``_to be filled in after round-1_``
+    placeholder on first write and stays idempotent on re-runs.
+
+    ``quick_baseline_log`` is the campaign-relative path to the log
+    produced by BASELINE step 6. Passing ``None`` or an empty string
+    drops the ``Quick baseline log:`` line entirely so phases that
+    bail before emitting the log still produce a well-formed block.
     """
     score_str = _fmt_scores(aggregate_score)
     lines = [
-        "",
-        "",
-        f"## Baseline Entry ({_now()})",
+        f"### Baseline Entry ({_now()})",
         f"- Backend: {backend}",
         f"- GPU: {gpu}",
         f"- Commit: {commit or 'n/a'}",
@@ -141,7 +277,14 @@ def append_baseline(
     ]
     if quick_baseline_log:
         lines.append(f"- Quick baseline log: {quick_baseline_log}")
-    _append(optimize_log_path(campaign_dir), "\n".join(lines) + "\n")
+    new_body = "\n".join(lines) + "\n"
+    fallback = "\n\n## Baseline\n" + new_body
+    _upsert_section_body(
+        optimize_log_path(campaign_dir),
+        "## Baseline",
+        new_body,
+        fallback_append=fallback,
+    )
 
 
 def append_round_entry(
@@ -157,8 +300,12 @@ def append_round_entry(
     decision: str,
     notes: str | None = None,
 ) -> None:
+    """Insert a ``### round-N`` entry at the end of ``## Optimization
+    History`` (not at EOF). Each round is an append because every round
+    is unique; the helper falls back to EOF append when the heading is
+    absent so pre-template logs keep working.
+    """
     block = (
-        "\n"
         f"### round-{round_n} — {description}\n"
         f"- Time: {_now()}\n"
         f"- Validation level: {validation_level}\n"
@@ -171,7 +318,123 @@ def append_round_entry(
     )
     if notes:
         block += f"- Notes: {notes}\n"
-    _append(optimize_log_path(campaign_dir), block)
+    _append_in_section(
+        optimize_log_path(campaign_dir),
+        "## Optimization History",
+        block,
+        fallback_append="\n" + block,
+    )
+
+
+def upsert_directions_to_try(
+    campaign_dir: Path,
+    *,
+    round_n: int,
+    directions: list[dict[str, Any]],
+) -> None:
+    """Replace ``## Directions to Try`` with the STAGNATION_REVIEW pick.
+
+    ``directions`` is the raw ``new_directions`` array from the phase
+    result. Each entry needs at least a ``title`` field; ``category``
+    and ``hypothesis`` are rendered when present. The checkbox style
+    (``- [ ] ...``) matches the reference campaign so ``parse_directions
+    _to_try`` continues to work unchanged.
+
+    Skipping this call (e.g. when ``directions`` is empty) is a no-op
+    so phases that decide "no new directions" don't wipe the section.
+    """
+    cleaned: list[str] = []
+    for entry in directions or []:
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("title") or "").strip()
+        if not title:
+            continue
+        category = str(entry.get("category") or "").strip()
+        hypothesis = str(entry.get("hypothesis") or "").strip()
+        tail_parts: list[str] = []
+        if category:
+            tail_parts.append(f"[{category}]")
+        if hypothesis:
+            tail_parts.append(hypothesis)
+        tail = " — " + " ".join(tail_parts) if tail_parts else ""
+        cleaned.append(f"- [ ] {title}{tail}")
+    if not cleaned:
+        return
+    caption = f"_Updated after round-{round_n} stagnation review ({_now()})_"
+    new_body = caption + "\n\n" + "\n".join(cleaned) + "\n"
+    fallback = "\n\n## Directions to Try\n" + new_body
+    _upsert_section_body(
+        optimize_log_path(campaign_dir),
+        "## Directions to Try",
+        new_body,
+        fallback_append=fallback,
+    )
+
+
+def upsert_current_best(
+    campaign_dir: Path,
+    *,
+    best_round: int | None,
+    best_score: dict[str, float] | None,
+    baseline_score: dict[str, float] | None,
+) -> None:
+    """Replace ``## Current Best`` with a three-column improvement table.
+
+    Only metrics present in ``best_score`` are rendered. A metric with a
+    ``None``/missing baseline keeps the baseline cell as ``-`` so the row
+    still renders during resume-from-cache cases where the baseline has
+    not yet been persisted into ``state.history``.
+    """
+    metrics = _current_best_rows(best_score, baseline_score)
+    if not metrics:
+        return
+    header_lines = [
+        "| Metric | Baseline | Current Best | Improvement |",
+        "|---|---:|---:|---:|",
+    ]
+    round_caption = (
+        f"_Updated after round-{best_round} ({_now()})_"
+        if best_round is not None
+        else f"_Updated ({_now()})_"
+    )
+    lines = [round_caption, ""] + header_lines + metrics
+    new_body = "\n".join(lines) + "\n"
+    fallback = "\n\n## Current Best\n" + new_body
+    _upsert_section_body(
+        optimize_log_path(campaign_dir),
+        "## Current Best",
+        new_body,
+        fallback_append=fallback,
+    )
+
+
+def _current_best_rows(
+    best_score: dict[str, float] | None,
+    baseline_score: dict[str, float] | None,
+) -> list[str]:
+    if not best_score:
+        return []
+    baseline = baseline_score or {}
+    out: list[str] = []
+    for metric, cur in best_score.items():
+        if cur is None:
+            continue
+        base = baseline.get(metric)
+        base_cell = "-" if base is None else f"{float(base):.3f}"
+        cur_cell = f"{float(cur):.3f}"
+        improvement = "-"
+        if base not in (None, 0):
+            try:
+                delta = (float(cur) - float(base)) / float(base) * 100.0
+            except (TypeError, ValueError, ZeroDivisionError):
+                delta = None
+            if delta is not None:
+                improvement = f"{delta:+.2f}%"
+        out.append(
+            f"| {metric} | {base_cell} | {cur_cell} | {improvement} |"
+        )
+    return out
 
 
 VERIFIED_INEFFECTIVE_SIDECAR = "verified_ineffective.jsonl"
@@ -185,16 +448,29 @@ def append_verified_ineffective(
     reason: str,
     modified_files: list[str] | None = None,
 ) -> None:
-    """Append both the markdown row (human-readable) and a JSONL sidecar
-    row carrying the structured ``modified_files`` list.
+    """Insert a row under the ``## Verified Ineffective Directions`` table
+    and mirror the structured payload into the JSONL sidecar.
 
     The markdown row stays schema-stable so existing parsers keep
     working; the sidecar is the source of truth for dedup because
     Jaccard overlap on file paths is a stronger signal than textual
-    similarity of the hypothesis prose.
+    similarity of the hypothesis prose. When the section exists but the
+    table header is missing we seed a fresh header so the inserted row
+    does not land as orphan text.
     """
-    row = f"| {direction} | round-{round_n} | {reason} |\n"
-    _append(optimize_log_path(campaign_dir), row)
+    row = f"| {direction} | round-{round_n} | {reason} |"
+    path = optimize_log_path(campaign_dir)
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    try:
+        prefix, body, suffix = _split_section(
+            text, "## Verified Ineffective Directions"
+        )
+    except KeyError:
+        _append(path, row + "\n")
+    else:
+        new_body = _insert_into_ineffective_table(body, row)
+        new_body = _normalize_body(new_body, has_suffix=bool(suffix))
+        path.write_text(prefix + new_body + suffix, encoding="utf-8")
 
     sidecar = campaign_dir / VERIFIED_INEFFECTIVE_SIDECAR
     sidecar.parent.mkdir(parents=True, exist_ok=True)
@@ -208,9 +484,88 @@ def append_verified_ineffective(
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+_INEFFECTIVE_HEADER = "| Direction | Version | Failure Reason |"
+_INEFFECTIVE_SEPARATOR = "|-----------|---------|----------------|"
+
+
+def _insert_into_ineffective_table(body: str, row: str) -> str:
+    """Insert ``row`` at the end of the existing table inside ``body``.
+
+    If the body has no table at all we re-create the canonical header +
+    separator from the template and place the row underneath, so the
+    section stays readable even after manual edits.
+    """
+    lines = body.splitlines()
+    has_header = any(l.strip().startswith("| Direction |") for l in lines)
+    has_sep = any(l.strip().startswith("|--") for l in lines)
+    if not has_header or not has_sep:
+        return (
+            _INEFFECTIVE_HEADER
+            + "\n"
+            + _INEFFECTIVE_SEPARATOR
+            + "\n"
+            + row
+            + "\n"
+        )
+    insert_at = len(lines)
+    while insert_at > 0 and lines[insert_at - 1].strip() == "":
+        insert_at -= 1
+    lines.insert(insert_at, row)
+    return "\n".join(lines) + "\n"
+
+
 def append_final_report(campaign_dir: Path, body: str) -> None:
-    block = "\n\n## Final Report\n" + body.rstrip() + "\n"
-    _append(optimize_log_path(campaign_dir), block)
+    """Append the final-report block into the ``## Final Report`` section.
+
+    The termination-check block (written separately) and the full report
+    payload both live inside the same ``## Final Report`` section body.
+    The ``_filled in when campaign terminates_`` placeholder is scrubbed
+    on first write.
+    """
+    addition = body.rstrip() + "\n"
+    fallback = "\n\n## Final Report\n" + addition
+    _append_in_section(
+        optimize_log_path(campaign_dir),
+        "## Final Report",
+        addition,
+        placeholders={FINAL_REPORT_PLACEHOLDER},
+        fallback_append=fallback,
+    )
+
+
+def append_termination_block(
+    campaign_dir: Path,
+    *,
+    checks: dict[str, bool],
+    passed: list[str],
+) -> None:
+    """Append the ``### Termination Check`` block into ``## Final Report``.
+
+    Kept here (rather than inline in ``campaign.py``) so all writes to
+    ``optimize.md`` go through the section-aware helpers and share
+    placeholder-scrubbing semantics.
+    """
+    mapping = {
+        "T1": "performance_target",
+        "T2": "hardware efficiency",
+        "T3": "max_iterations reached",
+        "T4": "max_duration reached",
+        "T5": "user requested stop",
+    }
+    lines = ["### Termination Check"]
+    for key in ("T1", "T2", "T3", "T4", "T5"):
+        marker = "PASS" if checks.get(key) else "no"
+        lines.append(f"- {key} {mapping[key]}: {marker}")
+    lines.append(f"-> Satisfied condition(s): {', '.join(passed)}")
+    addition = "\n".join(lines) + "\n"
+    fallback = "\n\n## Final Report\n" + addition
+    _append_in_section(
+        optimize_log_path(campaign_dir),
+        "## Final Report",
+        addition,
+        placeholders={FINAL_REPORT_PLACEHOLDER},
+        fallback_append=fallback,
+    )
 
 
 # --- performance_trend.md ----------------------------------------------

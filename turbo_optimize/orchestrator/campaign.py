@@ -23,12 +23,15 @@ from turbo_optimize.logs import (
     append_baseline,
     append_final_report,
     append_round_entry,
+    append_termination_block,
     append_trend_row,
     append_verified_ineffective,
     extract_history,
     init_cost_log,
     init_optimize_log,
     init_performance_trend,
+    upsert_current_best,
+    upsert_directions_to_try,
 )
 from turbo_optimize.manifest import (
     ManifestError,
@@ -501,11 +504,19 @@ async def _phase_stagnation(params: CampaignParams, state: RunState) -> None:
     await _run_profile_phase(
         params, state, round_n=state.current_round, trigger="pre_stagnation"
     )
-    await stagnation_review.run(
+    outcome = await stagnation_review.run(
         params,
         rollback_streak=state.rollback_streak,
         current_round=state.current_round,
     )
+    result = outcome.structured or {}
+    directions = result.get("new_directions") or []
+    if params.campaign_dir is not None and isinstance(directions, list):
+        upsert_directions_to_try(
+            params.campaign_dir,
+            round_n=state.current_round,
+            directions=directions,
+        )
     advance_phase(state, "TERMINATION_CHECK")
     save_run_state(params.state_dir, state)
 
@@ -1100,6 +1111,12 @@ def _after_decision(
             vs_baseline=_baseline_deltas(state, fwd_avg, bwd_avg, step_geo),
             key_finding=hypothesis.get("verification_signal", ""),
         )
+        upsert_current_best(
+            params.campaign_dir,
+            best_round=round_n,
+            best_score=aggregate,
+            baseline_score=_baseline_score_from_state(state),
+        )
         _git_commit_if_enabled(params, round_n, hypothesis, decision)
         advance_phase(state, "TERMINATION_CHECK")
     elif decision.decision == "ACCEPT_PENDING_NOISE":
@@ -1145,6 +1162,12 @@ def _after_decision(
             step_geomean=step_geo,
             vs_baseline=_baseline_deltas(state, fwd_avg, bwd_avg, step_geo),
             key_finding="noise-bounded accept",
+        )
+        upsert_current_best(
+            params.campaign_dir,
+            best_round=round_n,
+            best_score=aggregate,
+            baseline_score=_baseline_score_from_state(state),
         )
         _git_commit_if_enabled(params, round_n, hypothesis, decision)
         advance_phase(state, "TERMINATION_CHECK")
@@ -1294,23 +1317,9 @@ def _append_termination_block(
 ) -> None:
     from turbo_optimize.logs import optimize_log_path
 
-    path = optimize_log_path(campaign_dir)
-    if not path.exists():
+    if not optimize_log_path(campaign_dir).exists():
         return
-    lines = ["", "### Termination Check"]
-    mapping = {
-        "T1": "performance_target",
-        "T2": "hardware efficiency",
-        "T3": "max_iterations reached",
-        "T4": "max_duration reached",
-        "T5": "user requested stop",
-    }
-    for key in ("T1", "T2", "T3", "T4", "T5"):
-        marker = "PASS" if checks[key] else "no"
-        lines.append(f"- {key} {mapping[key]}: {marker}")
-    lines.append(f"-> Satisfied condition(s): {', '.join(passed)}")
-    with path.open("a", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    append_termination_block(campaign_dir, checks=checks, passed=passed)
 
 
 async def _final_report(params: CampaignParams, state: RunState, *, reason: str) -> None:
@@ -1448,10 +1457,9 @@ def _baseline_deltas(
     Returns None for the baseline row (it renders the cell as `—`). Each
     component can independently be None when the baseline lacks that direction.
     """
-    baseline = next((h for h in state.history if h["decision"] == "BASELINE"), None)
-    if not baseline:
+    base = _baseline_score_from_state(state)
+    if not base:
         return None
-    base = baseline.get("score") or {}
     base_fwd = _safe_float(base.get("Forward TFLOPS"))
     base_bwd = _safe_float(base.get("Backward TFLOPS"))
     base_step = _compute_step_geomean(base_fwd, base_bwd)
@@ -1460,6 +1468,22 @@ def _baseline_deltas(
         "fwd": _pct_delta(candidate_fwd, base_fwd),
         "bwd": _pct_delta(candidate_bwd, base_bwd),
     }
+
+
+def _baseline_score_from_state(state: RunState) -> dict[str, float] | None:
+    """Return the aggregate score recorded by the BASELINE history event.
+
+    Shared by :func:`_baseline_deltas` (trend rendering) and the new
+    ``upsert_current_best`` call so both references use the same
+    baseline dict rather than duplicating history-scan logic.
+    """
+    baseline = next(
+        (h for h in state.history if h.get("decision") == "BASELINE"), None
+    )
+    if not baseline:
+        return None
+    score = baseline.get("score") or {}
+    return {k: float(v) for k, v in score.items() if isinstance(v, (int, float))}
 
 
 def _pct_delta(candidate: float | None, baseline: float | None) -> float | None:
