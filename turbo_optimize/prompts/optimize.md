@@ -61,7 +61,9 @@ Tasks:
 
 Forbidden:
 - Do NOT run tests or benchmarks here; VALIDATE will do that.
-- Do NOT commit to git; VALIDATE handles git_commit after acceptance.
+- Do NOT commit to git. The orchestrator runs `git commit` automatically
+  after the Python-side decision confirms ACCEPT (git_commit is forced
+  on for every campaign).
 - Do NOT modify files outside the kernel source path and the
   per-round artifacts folder.
 

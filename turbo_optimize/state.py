@@ -42,6 +42,12 @@ PHASE_ORDER: tuple[str, ...] = (
     "ANALYZE",
     "OPTIMIZE",
     "VALIDATE",
+    # REVIEW is an optional per-round phase that only runs when
+    # VALIDATE (full) concluded the round is ACCEPT-flavoured. In
+    # ROLLBACK rounds the orchestrator skips straight from VALIDATE
+    # to DECIDE. See :func:`turbo_optimize.orchestrator.phases.review`
+    # for the tolerant-mode contract.
+    "REVIEW",
     "DECIDE",
     "STAGNATION_REVIEW",
     "TERMINATION_CHECK",

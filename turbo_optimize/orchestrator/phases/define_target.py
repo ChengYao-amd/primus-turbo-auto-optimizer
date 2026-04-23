@@ -70,7 +70,6 @@ async def run(params: CampaignParams) -> PhaseOutcome:
             "manifest_path": str(manifest_path),
             "cli_max_iterations": _yaml_value(params.max_iterations),
             "cli_max_duration": _yaml_value(params.max_duration),
-            "cli_git_commit": "true" if params.git_commit else "false",
             "cli_base_branch": _yaml_value(params.base_branch),
         },
     )

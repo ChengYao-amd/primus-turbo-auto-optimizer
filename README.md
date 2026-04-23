@@ -303,20 +303,20 @@ for security reasons
 满足三个条件时，注入 `IS_SANDBOX=1` 到子进程 env。显式 `export IS_SANDBOX=0`
 会被尊重（用于在非真实 sandbox 的裸机 root 下强制保留原始保护）。
 
-### Git 提交开关
+### Git 提交策略（不可配置）
 
-默认关闭：ACCEPT 轮不会自动 `git commit`，manifest / 代码改动留在工作树里
-由用户自己处理。
+`git_commit=true` 和 `git_branch=auto` 由 orchestrator 模块级常量
+`FORCED_GIT_COMMIT` / `FORCED_GIT_BRANCH`（`turbo_optimize.orchestrator.campaign`）
+强制应用，CLI 与 manifest 都不再暴露开关。原因：
 
-| 旋钮 | 开关 | 说明 |
-|---|---|---|
-| `git_commit` | `--git-commit` / `--no-git-commit` | 默认 `--no-git-commit`。CLI 优先级高于 manifest，也就是说即便 DEFINE_TARGET 写出的 `manifest.yaml` 里保留了 `git_commit: true`，Python 端仍按 CLI 值执行，避免被 Claude 默认值污染。 |
+- 文件拷贝式回滚（`_rollback_kernel`）无法还原嵌套子目录、删除本轮新增的文件、清空 Triton JIT 或 `__pycache__` 缓存。唯一可靠的回滚路径是「每个 ACCEPT 轮都落一次 commit，之后用 `git reset --hard` 倒带」。
+- `git_branch=auto` 意味着 PREPARE_ENVIRONMENT 会基于 `base_branch` 创建
+  `optimize/<campaign_id>` 专用分支，用户的源分支不会沉淀实验性 commit。
 
-如果确实想恢复"每个 ACCEPT 自动 commit"的老行为：
-
-```bash
-primus-turbo-optimize -p "..." --git-commit
-```
+manifest.yaml 里仍然留有的 `git_commit` / `git_branch` 字段会被 orchestrator
+直接忽略；写 `--git-commit` / `--no-git-commit` 参数会被 argparse 拒绝。
+如需审计，MANIFEST_CONFIRM 和 PREPARE_ENVIRONMENT 两个阶段都会把上述策略
+以结构化 `log.info` 的形式输出一遍。
 
 ### `--max-iterations` / `--max-duration`
 

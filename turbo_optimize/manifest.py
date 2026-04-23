@@ -44,9 +44,12 @@ REQUIRED_FIELDS: tuple[str, ...] = (
     "quick_command",
     "profile_command",
     "base_branch",
-    "git_commit",
-    "git_branch",
 )
+# NOTE: ``git_commit`` / ``git_branch`` were removed from this tuple
+# when the orchestrator started force-applying :data:`FORCED_GIT_COMMIT`
+# / :data:`FORCED_GIT_BRANCH` (see
+# ``turbo_optimize.orchestrator.campaign``). Legacy manifests that still
+# carry those keys are accepted but the values are ignored.
 
 
 CONFIRM_FILE_NAME = "manifest.confirmed"
@@ -119,7 +122,10 @@ def validate_manifest(manifest: dict[str, Any]) -> ManifestValidation:
 
 
 def summarize_for_prompt(manifest: dict[str, Any]) -> str:
-    lines = ["Draft manifest.yaml (key fields):"]
+    lines = [
+        "Draft manifest.yaml (key fields):",
+        "  [git policy] git_commit=true, git_branch=auto (forced)",
+    ]
     keys = [
         "target_op",
         "target_backend",
@@ -130,8 +136,6 @@ def summarize_for_prompt(manifest: dict[str, Any]) -> str:
         "target_shapes",
         "profile_command",
         "base_branch",
-        "git_commit",
-        "git_branch",
         "max_iterations",
         "max_duration",
     ]

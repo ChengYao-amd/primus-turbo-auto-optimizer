@@ -14,6 +14,16 @@ Confirmed manifest:
 
 Campaign directory: `{campaign_dir}`
 
+Forced git policy (already enforced by the orchestrator — do NOT read
+these from `manifest.yaml`, they are not there):
+
+  git_commit: true   — every ACCEPTED round will be committed after
+                       validation passes. The clean-tree gate below is
+                       therefore unconditional.
+  git_branch: auto   — always create a dedicated
+                       `optimize/<campaign_id>` branch off
+                       `manifest.base_branch` in this phase.
+
 {workspace_hygiene_block}
 Tasks, in order:
 
@@ -34,20 +44,20 @@ Tasks, in order:
       `composable_kernel` tracked on a feature branch), and a plain
       `git commit` in the parent repo never folds submodule work-tree
       edits into the commit anyway. If the remaining porcelain output is
-      non-empty AND `manifest.git_commit == true`, set
-      `workspace_clean=false` in the JSON and stop: dirty commits on top
-      of arbitrary local edits in the parent repo are unreproducible.
-      `workspace_clean=true` only when the submodule-ignored porcelain
-      output is empty. For audit, also run `git submodule status` and
-      put the one-line summary under `submodule_state` in the JSON;
-      set `submodule_state_ignored=true` to make the relaxation
-      explicit.
-2. If the gate above passed and `git_branch != "none"`, run the
-   appropriate `git checkout -b`. Use the exact branch name from
-   manifest.git_branch (`auto` → create `optimize/<campaign_id>`,
-   where campaign_id is `{campaign_id}`). Branch off
-   `manifest.base_branch` explicitly:
-   `git checkout -b <target> <base_branch>`.
+      non-empty, set `workspace_clean=false` in the JSON and stop:
+      `git_commit` is forced on for every campaign, and dirty commits
+      on top of arbitrary local edits in the parent repo are
+      unreproducible. `workspace_clean=true` only when the
+      submodule-ignored porcelain output is empty. For audit, also run
+      `git submodule status` and put the one-line summary under
+      `submodule_state` in the JSON; set `submodule_state_ignored=true`
+      to make the relaxation explicit.
+2. If the gate above passed, create the dedicated optimize branch off
+   `manifest.base_branch`:
+   `git checkout -b optimize/{campaign_id} <base_branch>`.
+   If the branch already exists (resume/retry), fall back to
+   `git checkout optimize/{campaign_id}` instead of re-creating it.
+   Record the resolved branch name in `git_branch_created` below.
 2. Ensure the full campaign directory tree exists, per the skill excerpt:
    `logs/`, `profiles/`, `rounds/round-1/{{kernel_snapshot,artifacts}}`.
 3. Initialise (or leave intact) the baseline log skeleton. The orchestrator

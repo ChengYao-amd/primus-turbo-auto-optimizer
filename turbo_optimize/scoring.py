@@ -82,6 +82,96 @@ class DecisionResult:
     noise_check_required: bool
 
 
+# --- REVIEW signals (tolerant mode) -----------------------------------
+
+
+REVIEW_VERDICT_AGREE = "AGREE"
+REVIEW_VERDICT_DOWNGRADE_TO_NOISE_BOUND = "DOWNGRADE_TO_NOISE_BOUND"
+REVIEW_VERDICT_DOWNGRADE_TO_ROLLBACK = "DOWNGRADE_TO_ROLLBACK"
+REVIEW_VERDICT_ESCALATE_HUMAN = "ESCALATE_HUMAN"
+
+REVIEW_VERDICTS: tuple[str, ...] = (
+    REVIEW_VERDICT_AGREE,
+    REVIEW_VERDICT_DOWNGRADE_TO_NOISE_BOUND,
+    REVIEW_VERDICT_DOWNGRADE_TO_ROLLBACK,
+    REVIEW_VERDICT_ESCALATE_HUMAN,
+)
+
+
+# Metric keyword → canonical Primus-Turbo metric name. Used by both the
+# hypothesis-text parser and the off-target-gain attribution heuristic,
+# so a single keyword table keeps them consistent.
+_FWD_KEYWORDS: tuple[str, ...] = (
+    "forward", "fwd", "_fw_", "_fwkernel_",
+    "grouped_fp8_persistent", "persistent_gemm", "tile_cumsum",
+)
+_BWD_KEYWORDS: tuple[str, ...] = (
+    "backward", "bwd", "_bw_", "_bwkernel_",
+    "variable_k", "grouped_variable_k",
+)
+
+
+@dataclass
+class ReviewSignal:
+    """One structured finding inside a REVIEW phase output.
+
+    ``severity`` is either ``"info"`` / ``"warn"`` / ``"block"``.
+    Only ``"block"`` fires a verdict transition in tolerant mode, and
+    only for the three hard-rule signals (hypothesis-metric alignment,
+    off-target gain, correctness bit-identity). ``"warn"`` is used for
+    the quick-vs-full agreement and noise-band signals which exist to
+    inform operators but do not, on their own, overrule a numeric
+    ACCEPT in tolerant mode.
+    """
+
+    name: str
+    passed: bool
+    severity: str
+    details: dict[str, Any]
+    note: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "passed": self.passed,
+            "severity": self.severity,
+            "details": dict(self.details),
+            "note": self.note,
+        }
+
+
+@dataclass
+class ReviewBundle:
+    """Structured output of :func:`compute_review_signals`.
+
+    * ``signals`` — the five named findings in fixed order so the
+      prompt can refer to them by index.
+    * ``tolerant_verdict`` — preliminary verdict the orchestrator would
+      apply if the REVIEW phase's LLM returned no override; the LLM's
+      ``review_verdict`` takes precedence when present.
+    * ``tolerant_reason`` — human-readable explanation behind
+      ``tolerant_verdict``; preserved in the phase result and in the
+      decision reason when a downgrade actually fires.
+    """
+
+    signals: list[ReviewSignal]
+    tolerant_verdict: str
+    tolerant_reason: str
+
+    def signal(self, name: str) -> ReviewSignal | None:
+        for s in self.signals:
+            if s.name == name:
+                return s
+        return None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "signals": [s.to_dict() for s in self.signals],
+            "tolerant_verdict": self.tolerant_verdict,
+            "tolerant_reason": self.tolerant_reason,
+        }
+
+
 def split_primary_metric(primary_metric: str) -> list[str]:
     if not primary_metric:
         return [DEFAULT_PRIMARY]
@@ -714,6 +804,616 @@ def decide_accept_rollback(
         regressions=regressions,
         noise_check_required=False,
     )
+
+
+# --- REVIEW signal extraction -----------------------------------------
+
+
+def _classify_metric_axis(text: str) -> set[str]:
+    """Return the set of canonical metric axes a free-text blob touches.
+
+    Returns a subset of ``{"Forward", "Backward"}``. An empty set means
+    the text carries no metric-direction keyword and callers should
+    treat the axis as undetermined (never as "both").
+    """
+    low = text.lower()
+    axes: set[str] = set()
+    if any(k in low for k in _FWD_KEYWORDS):
+        axes.add("Forward")
+    if any(k in low for k in _BWD_KEYWORDS):
+        axes.add("Backward")
+    return axes
+
+
+_PREDICTED_PCT_RE = re.compile(
+    r"""
+    (?:
+        (?P<metric>forward|backward|fwd|bwd|step[_\s]geomean|geomean)
+        [^+\-\d%]{0,20}
+    )?
+    (?P<sign>[+\-]?)
+    (?P<value>\d+(?:\.\d+)?)
+    \s*%
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _extract_predicted_directions(hypothesis: dict[str, Any]) -> dict[str, float]:
+    """Return ``{metric_axis: min_predicted_pct}`` parsed from hypothesis text.
+
+    Scans ``expected_benefit`` first, then ``verification_signal``, then
+    ``primary_hypothesis`` until a ``"+N%"`` pattern is found. If the
+    surrounding context names a direction (``forward`` / ``backward``
+    / ``step_geomean``), the percentage is attributed to that axis;
+    otherwise it is attributed to every axis mentioned elsewhere in
+    the hypothesis text (or dropped when no axis keyword is present).
+    """
+    out: dict[str, float] = {}
+    sources = [
+        str(hypothesis.get("expected_benefit") or ""),
+        str(hypothesis.get("verification_signal") or ""),
+        str(hypothesis.get("primary_hypothesis") or ""),
+    ]
+    text_axes = _classify_metric_axis(" ".join(sources))
+    for text in sources:
+        for m in _PREDICTED_PCT_RE.finditer(text):
+            raw_metric = (m.group("metric") or "").lower()
+            sign = m.group("sign") or ""
+            value_str = m.group("value") or "0"
+            try:
+                value = float(value_str)
+            except ValueError:
+                continue
+            if sign == "-":
+                continue
+            if raw_metric in ("forward", "fwd"):
+                axes = {"Forward"}
+            elif raw_metric in ("backward", "bwd"):
+                axes = {"Backward"}
+            elif raw_metric in ("step_geomean", "step geomean", "geomean"):
+                axes = {"Forward", "Backward"}
+            else:
+                axes = set(text_axes) or {"Forward", "Backward"}
+            for axis in axes:
+                if value > 0 and (axis not in out or value < out[axis]):
+                    out[axis] = value
+    return out
+
+
+def _classify_modified_paths(modified_files: Iterable[str]) -> set[str]:
+    """Infer which kernel axis the OPTIMIZE diff touched.
+
+    Returns a subset of ``{"Forward", "Backward"}``. Purely lexical —
+    the heuristic cannot tell a fwd-kernel edit apart from a bwd-kernel
+    edit in the same file, so a path that names neither axis is
+    classified as ``{"Forward", "Backward"}`` (i.e. undetermined,
+    treated by :func:`compute_review_signals` as "could have touched
+    either").
+    """
+    axes: set[str] = set()
+    for raw in modified_files:
+        if not raw:
+            continue
+        hits = _classify_metric_axis(str(raw))
+        axes |= hits
+    if not axes:
+        return {"Forward", "Backward"}
+    return axes
+
+
+def _as_canonical_metric(axis: str) -> str:
+    if axis == "Forward":
+        return "Forward TFLOPS"
+    if axis == "Backward":
+        return "Backward TFLOPS"
+    return axis
+
+
+def _metric_stddev_pct(vector: ScoreVector | None, metric: str) -> float:
+    """Return the geometric-mean stddev% for ``metric`` across PASS shapes.
+
+    Geomean (instead of max) is used because REVIEW's noise-band check
+    is interested in the typical measurement noise rather than the
+    worst outlier; :func:`observed_noise_pct` already reports the max
+    for the accept/rollback decision.
+    """
+    if vector is None:
+        return 0.0
+    values: list[float] = []
+    for row in vector.per_shape:
+        if row.check != "PASS":
+            continue
+        std = row.metrics_stddev_pct.get(metric)
+        if std is None or math.isnan(std) or std <= 0:
+            continue
+        values.append(float(std))
+    if not values:
+        return 0.0
+    return geomean(values)
+
+
+def _claims_numerical_equivalence(hypothesis: dict[str, Any]) -> bool:
+    """Heuristic: True if the hypothesis asserts bit-identical / numerically
+    equivalent output.
+
+    Matches common wordings used in the skill prompt ("bit-identical",
+    "numerically equivalent", "same output", "no numerical change").
+    False when the hypothesis explicitly allows numerical drift
+    ("within SNR threshold", "rtol", "absolute tolerance").
+    """
+    blob = " ".join(
+        str(hypothesis.get(k) or "")
+        for k in ("primary_hypothesis", "verification_signal", "expected_benefit")
+    ).lower()
+    positive = (
+        "bit-identical",
+        "bit identical",
+        "numerically equivalent",
+        "same output",
+        "no numerical change",
+        "preserves numerics",
+        "algebraically equivalent",
+    )
+    negative = (
+        "within snr",
+        "rtol",
+        "atol",
+        "absolute tolerance",
+        "numerical drift",
+    )
+    if any(tok in blob for tok in negative):
+        return False
+    return any(tok in blob for tok in positive)
+
+
+def _min_snr_from_score_vector(score_vector_rows: list[dict[str, Any]]) -> float | None:
+    """Return the worst SNR (dB) across ``out_snr`` / ``da_snr`` / ``db_snr``
+    columns in the VALIDATE score-vector payload.
+
+    VALIDATE serialises the CSV rows as the ``score_vector`` list on its
+    phase_result; the per-shape dicts carry the raw SNR floats so the
+    review gate can assert bit-identity without re-reading the CSV.
+    Rows without any SNR column (rowwise / blockwise kernels) return
+    ``None``.
+    """
+    if not score_vector_rows:
+        return None
+    snr_keys = ("out_snr", "da_snr", "db_snr")
+    values: list[float] = []
+    for row in score_vector_rows:
+        if not isinstance(row, dict):
+            continue
+        for key in snr_keys:
+            raw = row.get(key)
+            if raw is None or raw == "":
+                continue
+            try:
+                values.append(float(raw))
+            except (TypeError, ValueError):
+                continue
+    if not values:
+        return None
+    return min(values)
+
+
+def compute_review_signals(
+    *,
+    hypothesis: dict[str, Any],
+    opt_result: dict[str, Any],
+    quick_val_result: dict[str, Any] | None,
+    full_val_result: dict[str, Any] | None,
+    quick_candidate: ScoreVector | None,
+    full_candidate: ScoreVector | None,
+    best: ScoreVector | None,
+    primary_metric: str,
+    mode: str = "tolerant",
+) -> ReviewBundle:
+    """Run the five hard rules of the REVIEW phase on structured inputs.
+
+    The caller passes the ScoreVector objects already parsed from the
+    quick and (optionally) full CSVs, plus the raw VALIDATE phase
+    results for SNR / correctness extraction. The function returns a
+    :class:`ReviewBundle` with one :class:`ReviewSignal` per rule and a
+    preliminary ``tolerant_verdict`` computed entirely from the
+    ``"block"`` / ``"warn"`` severity pattern:
+
+    * ``ESCALATE_HUMAN``  — correctness-bit-identity block (hypothesis
+      claimed numerical equivalence but measured SNR dropped).
+    * ``DOWNGRADE_TO_ROLLBACK`` — hypothesis-metric-alignment AND
+      off-target-gain both block (strong evidence the measured gain is
+      not the one the hypothesis predicts).
+    * ``DOWNGRADE_TO_NOISE_BOUND`` — exactly one of the two
+      (alignment / off-target) blocks, or the decision's improvement
+      sits inside the noise band even without a blocking signal.
+    * ``AGREE`` — no blocking signals; any warn-severity findings are
+      forwarded for information only.
+
+    ``mode`` currently accepts ``"tolerant"`` only; strict mode would
+    promote the two ``"warn"`` signals to ``"block"``.
+    """
+    if mode != "tolerant":
+        raise ScoringError(f"only review mode 'tolerant' is implemented (got {mode!r})")
+
+    metrics = split_primary_metric(primary_metric)
+    improvement = compare_score(
+        quick_candidate.aggregate if quick_candidate else {},
+        best.aggregate if best else {},
+    )
+
+    align = _signal_hypothesis_metric_alignment(
+        hypothesis=hypothesis,
+        improvement=improvement,
+        quick_candidate=quick_candidate,
+    )
+    off_target = _signal_off_target_gain(
+        opt_result=opt_result,
+        improvement=improvement,
+    )
+    quick_full = _signal_quick_vs_full_agreement(
+        quick_candidate=quick_candidate,
+        full_candidate=full_candidate,
+        best=best,
+        metrics=metrics,
+    )
+    noise = _signal_noise_band(
+        improvement=improvement,
+        quick_candidate=quick_candidate,
+        metrics=metrics,
+    )
+    correctness = _signal_correctness_bit_identity(
+        hypothesis=hypothesis,
+        quick_val_result=quick_val_result,
+        full_val_result=full_val_result,
+    )
+
+    signals = [align, off_target, quick_full, noise, correctness]
+    verdict, reason = _tolerant_verdict(signals)
+    return ReviewBundle(
+        signals=signals,
+        tolerant_verdict=verdict,
+        tolerant_reason=reason,
+    )
+
+
+def _signal_hypothesis_metric_alignment(
+    *,
+    hypothesis: dict[str, Any],
+    improvement: dict[str, float],
+    quick_candidate: ScoreVector | None,
+) -> ReviewSignal:
+    predicted = _extract_predicted_directions(hypothesis)
+    if not predicted:
+        return ReviewSignal(
+            name="hypothesis_metric_alignment",
+            passed=True,
+            severity="info",
+            details={
+                "predicted": {},
+                "observed_pct": dict(improvement),
+            },
+            note=(
+                "hypothesis did not name a target metric axis with a "
+                "quantified delta; skipping alignment check"
+            ),
+        )
+
+    misaligned: list[dict[str, Any]] = []
+    for axis, predicted_pct in predicted.items():
+        metric = _as_canonical_metric(axis)
+        observed = improvement.get(metric, 0.0)
+        stddev_pct = _metric_stddev_pct(quick_candidate, metric)
+        sigma_ratio = observed / stddev_pct if stddev_pct > 0 else float("inf")
+        ok = observed >= min(predicted_pct * 0.25, predicted_pct - 1.0)
+        ok = ok and observed > 0
+        ok = ok and sigma_ratio >= 2.0
+        if not ok:
+            misaligned.append(
+                {
+                    "metric": metric,
+                    "predicted_pct": predicted_pct,
+                    "observed_pct": observed,
+                    "stddev_pct": stddev_pct,
+                    "sigma_ratio": sigma_ratio,
+                }
+            )
+    passed = not misaligned
+    severity = "info" if passed else "block"
+    note = (
+        "predicted-axis gains are within 25% of the predicted magnitude "
+        "and above 2σ of measurement noise"
+        if passed
+        else "predicted-axis gain is much smaller than the hypothesis claimed, "
+        "or lives inside the measurement noise band"
+    )
+    return ReviewSignal(
+        name="hypothesis_metric_alignment",
+        passed=passed,
+        severity=severity,
+        details={
+            "predicted_pct": predicted,
+            "observed_pct": dict(improvement),
+            "misaligned": misaligned,
+        },
+        note=note,
+    )
+
+
+def _signal_off_target_gain(
+    *,
+    opt_result: dict[str, Any],
+    improvement: dict[str, float],
+) -> ReviewSignal:
+    modified_files = opt_result.get("modified_files") or []
+    modified_axes = _classify_modified_paths(str(p) for p in modified_files)
+    fwd_gain = improvement.get("Forward TFLOPS", 0.0)
+    bwd_gain = improvement.get("Backward TFLOPS", 0.0)
+
+    if modified_axes == {"Forward", "Backward"}:
+        return ReviewSignal(
+            name="off_target_gain",
+            passed=True,
+            severity="info",
+            details={
+                "modified_files": list(modified_files),
+                "modified_axes": sorted(modified_axes),
+                "fwd_gain_pct": fwd_gain,
+                "bwd_gain_pct": bwd_gain,
+            },
+            note=(
+                "modified files name neither fwd nor bwd exclusively; "
+                "cannot attribute gain to a specific axis"
+            ),
+        )
+
+    dominant_axis = "Forward" if fwd_gain >= bwd_gain else "Backward"
+    passed = dominant_axis in modified_axes
+    severity = "info" if passed else "block"
+    note = (
+        f"dominant gain axis ({dominant_axis}) is contained in the "
+        "modified-path set"
+        if passed
+        else (
+            f"dominant gain axis ({dominant_axis}) is NOT in the modified-path "
+            f"set {sorted(modified_axes)} — the observed improvement is "
+            "likely from a codepath the hypothesis did not touch"
+        )
+    )
+    return ReviewSignal(
+        name="off_target_gain",
+        passed=passed,
+        severity=severity,
+        details={
+            "modified_files": list(modified_files),
+            "modified_axes": sorted(modified_axes),
+            "dominant_axis": dominant_axis,
+            "fwd_gain_pct": fwd_gain,
+            "bwd_gain_pct": bwd_gain,
+        },
+        note=note,
+    )
+
+
+def _signal_quick_vs_full_agreement(
+    *,
+    quick_candidate: ScoreVector | None,
+    full_candidate: ScoreVector | None,
+    best: ScoreVector | None,
+    metrics: list[str],
+) -> ReviewSignal:
+    if full_candidate is None or quick_candidate is None or best is None:
+        return ReviewSignal(
+            name="quick_vs_full_agreement",
+            passed=True,
+            severity="info",
+            details={"full_available": full_candidate is not None},
+            note="full-sweep CSV not provided; skipping quick-vs-full comparison",
+        )
+    quick_delta = compare_score(quick_candidate.aggregate, best.aggregate)
+    full_delta = compare_score(full_candidate.aggregate, best.aggregate)
+    sign_flips: list[str] = []
+    for metric in metrics:
+        q = quick_delta.get(metric, 0.0)
+        f = full_delta.get(metric, 0.0)
+        if q > 0 and f < 0:
+            sign_flips.append(metric)
+        elif q < 0 and f > 0:
+            sign_flips.append(metric)
+    passed = not sign_flips
+    severity = "info" if passed else "warn"
+    note = (
+        "quick and full sweeps agree on the sign of every primary metric"
+        if passed
+        else (
+            f"quick and full sweeps disagree on the sign of: "
+            f"{', '.join(sign_flips)}; one of the two harnesses is sampling "
+            "a non-representative shape set"
+        )
+    )
+    return ReviewSignal(
+        name="quick_vs_full_agreement",
+        passed=passed,
+        severity=severity,
+        details={
+            "full_available": True,
+            "quick_delta_pct": quick_delta,
+            "full_delta_pct": full_delta,
+            "sign_flips": sign_flips,
+        },
+        note=note,
+    )
+
+
+def _signal_noise_band(
+    *,
+    improvement: dict[str, float],
+    quick_candidate: ScoreVector | None,
+    metrics: list[str],
+) -> ReviewSignal:
+    worst_sigma = float("inf")
+    worst_metric = ""
+    worst_stddev = 0.0
+    worst_gain = 0.0
+    for metric in metrics:
+        gain = improvement.get(metric, 0.0)
+        if gain <= 0:
+            continue
+        stddev = _metric_stddev_pct(quick_candidate, metric)
+        sigma_ratio = gain / stddev if stddev > 0 else float("inf")
+        if sigma_ratio < worst_sigma:
+            worst_sigma = sigma_ratio
+            worst_metric = metric
+            worst_stddev = stddev
+            worst_gain = gain
+    if worst_metric == "":
+        return ReviewSignal(
+            name="noise_band",
+            passed=True,
+            severity="info",
+            details={"reason": "no positive improvement to evaluate"},
+            note="no metric improved; noise-band check skipped",
+        )
+    passed = worst_sigma >= 2.0 or worst_gain >= NOISE_THRESHOLD_PCT
+    severity = "info" if passed else "warn"
+    note = (
+        f"{worst_metric} gain ({worst_gain:.2f}%) is {worst_sigma:.1f}σ above "
+        f"stddev {worst_stddev:.2f}% and clears the {NOISE_THRESHOLD_PCT}% "
+        "absolute noise band"
+        if passed
+        else (
+            f"{worst_metric} gain ({worst_gain:.2f}%) is only {worst_sigma:.1f}σ "
+            f"above stddev {worst_stddev:.2f}% and below the "
+            f"{NOISE_THRESHOLD_PCT}% absolute noise band"
+        )
+    )
+    return ReviewSignal(
+        name="noise_band",
+        passed=passed,
+        severity=severity,
+        details={
+            "worst_metric": worst_metric,
+            "worst_gain_pct": worst_gain,
+            "worst_stddev_pct": worst_stddev,
+            "sigma_ratio": worst_sigma,
+            "absolute_threshold_pct": NOISE_THRESHOLD_PCT,
+        },
+        note=note,
+    )
+
+
+def _signal_correctness_bit_identity(
+    *,
+    hypothesis: dict[str, Any],
+    quick_val_result: dict[str, Any] | None,
+    full_val_result: dict[str, Any] | None,
+) -> ReviewSignal:
+    claims_equivalent = _claims_numerical_equivalence(hypothesis)
+    min_snr = None
+    score_vectors: list[list[dict[str, Any]]] = []
+    for val in (quick_val_result, full_val_result):
+        if not isinstance(val, dict):
+            continue
+        rows = val.get("score_vector")
+        if isinstance(rows, list):
+            score_vectors.append(rows)
+    for rows in score_vectors:
+        candidate_min = _min_snr_from_score_vector(rows)
+        if candidate_min is None:
+            continue
+        min_snr = candidate_min if min_snr is None else min(min_snr, candidate_min)
+
+    if min_snr is None:
+        return ReviewSignal(
+            name="correctness_bit_identity",
+            passed=True,
+            severity="info",
+            details={
+                "claims_equivalent": claims_equivalent,
+                "min_snr_db": None,
+            },
+            note=(
+                "no SNR columns in VALIDATE output (kernel has no per-output "
+                "correctness signal); cannot verify bit-identity claim"
+            ),
+        )
+
+    bit_identity_threshold_db = 80.0
+    passed = (not claims_equivalent) or min_snr >= bit_identity_threshold_db
+    severity = "info" if passed else "block"
+    note = (
+        f"observed worst SNR {min_snr:.1f} dB — "
+        + (
+            "hypothesis does not claim numerical equivalence, so any finite "
+            "SNR is acceptable"
+            if not claims_equivalent
+            else f">= {bit_identity_threshold_db} dB threshold; claim holds"
+        )
+        if passed
+        else (
+            f"hypothesis claims numerical equivalence but worst SNR "
+            f"{min_snr:.1f} dB is below the {bit_identity_threshold_db} dB "
+            "bit-identity threshold"
+        )
+    )
+    return ReviewSignal(
+        name="correctness_bit_identity",
+        passed=passed,
+        severity=severity,
+        details={
+            "claims_equivalent": claims_equivalent,
+            "min_snr_db": min_snr,
+            "threshold_db": bit_identity_threshold_db,
+        },
+        note=note,
+    )
+
+
+def _tolerant_verdict(signals: list[ReviewSignal]) -> tuple[str, str]:
+    def _find(name: str) -> ReviewSignal | None:
+        for s in signals:
+            if s.name == name:
+                return s
+        return None
+
+    corr = _find("correctness_bit_identity")
+    align = _find("hypothesis_metric_alignment")
+    off_target = _find("off_target_gain")
+    noise = _find("noise_band")
+
+    if corr is not None and corr.severity == "block":
+        return (
+            REVIEW_VERDICT_ESCALATE_HUMAN,
+            f"correctness_bit_identity blocked: {corr.note}",
+        )
+
+    align_block = align is not None and align.severity == "block"
+    off_block = off_target is not None and off_target.severity == "block"
+
+    if align_block and off_block:
+        return (
+            REVIEW_VERDICT_DOWNGRADE_TO_ROLLBACK,
+            (
+                "hypothesis_metric_alignment AND off_target_gain both blocked — "
+                "the measured gain does not line up with the hypothesis and "
+                "does not come from the modified codepath"
+            ),
+        )
+    if align_block:
+        return (
+            REVIEW_VERDICT_DOWNGRADE_TO_NOISE_BOUND,
+            f"hypothesis_metric_alignment blocked: {align.note if align else ''}",
+        )
+    if off_block:
+        return (
+            REVIEW_VERDICT_DOWNGRADE_TO_NOISE_BOUND,
+            f"off_target_gain blocked: {off_target.note if off_target else ''}",
+        )
+    if noise is not None and not noise.passed:
+        return (
+            REVIEW_VERDICT_AGREE,
+            f"noise_band warning tolerated in tolerant mode: {noise.note}",
+        )
+    return (REVIEW_VERDICT_AGREE, "no blocking signals")
 
 
 # --- noise re-measurement ----------------------------------------------

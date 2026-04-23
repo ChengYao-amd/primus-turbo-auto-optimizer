@@ -30,11 +30,23 @@ null, or inferred values):
 
   max_iterations: {cli_max_iterations}
   max_duration:   {cli_max_duration}
-  git_commit:     {cli_git_commit}
   base_branch:    {cli_base_branch}
 
 If any override is `null`, write YAML `null` (not `~`, not the string
-"null"). Never change these four fields on your own initiative.
+"null"). Never change these three fields on your own initiative.
+
+Forced git policy (already enforced by the orchestrator, DO NOT write
+these keys into manifest.yaml):
+
+  git_commit: true   — every ACCEPTED round is committed so rollback
+                       can use `git reset --hard`. File-copy rollback
+                       alone cannot restore nested subdirs, delete
+                       newly-added files, or clear Triton/pycache
+                       artefacts.
+  git_branch: auto   — the PREPARE_ENVIRONMENT phase creates an
+                       `optimize/<campaign_id>` branch off `base_branch`
+                       so experiments never land on the user's source
+                       branch.
 
 Your tasks:
 
@@ -43,8 +55,9 @@ Your tasks:
    missing, keep walking the project skill's referenced files until you have
    it. Do not invent values.
 2. Map the user instruction onto the `target_*` / `execution_mode` /
-   `git_*` / `primary_metric` parameters per the DEFINE_TARGET table in the
-   skill excerpt above.
+   `primary_metric` parameters per the DEFINE_TARGET table in the
+   skill excerpt above. Do NOT emit `git_commit` or `git_branch` keys
+   in the manifest — the orchestrator applies them as fixed policy.
 3. Write a complete `manifest.yaml` at `{manifest_path}` using the template
    from the skill excerpt (lines near "Write manifest.yaml"). Required
    fields: target_op, target_backend, target_lang, target_gpu,
@@ -52,8 +65,7 @@ Your tasks:
    target_shapes, kernel_source, test_command, benchmark_command,
    quick_command, profile_command, representative_shapes (use an empty
    list or placeholder if BASELINE has not yet selected them),
-   related_work_file, base_branch, git_commit, git_branch,
-   max_iterations, max_duration, created.
+   related_work_file, base_branch, max_iterations, max_duration, created.
    - `quick_command`: write `python ${{CAMPAIGN_DIR}}/quick_test_bench.py`.
      The literal `${{CAMPAIGN_DIR}}` is a variable that the orchestrator
      expands at runtime; do NOT replace it with the actual path.
@@ -90,8 +102,6 @@ Your tasks:
   "quick_command": "python ${{CAMPAIGN_DIR}}/quick_test_bench.py",
   "profile_command": "python ${{CAMPAIGN_DIR}}/profile_op_shape.py",
   "base_branch": "<from CLI override or 'main'>",
-  "git_commit": true_or_false,
-  "git_branch": "<auto|none|string>",
   "max_iterations": null_or_integer,
   "max_duration": null_or_string,
   "prerequisite_checklist": {{

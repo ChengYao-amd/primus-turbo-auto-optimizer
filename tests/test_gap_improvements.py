@@ -387,13 +387,17 @@ def test_prepare_env_prompt_ignores_submodules():
 
 def test_enforce_base_branch_gate_passes_when_only_submodules_changed():
     """The Python gate should NOT fail when the prompt reports
-    workspace_clean=true (having ignored submodule drift)."""
+    workspace_clean=true (having ignored submodule drift).
+
+    Note: git_commit is force-applied as a module-level constant
+    (:data:`FORCED_GIT_COMMIT`), so the gate is equivalent to the
+    previous ``git_commit=True`` branch — no opt-out path exists.
+    """
     params = CampaignParams(
         prompt="opt gemm",
         workspace_root=Path("/tmp/ws"),
         state_dir=Path("/tmp/ws/state"),
         skills_root=Path("/tmp/skills"),
-        git_commit=True,
     )
     prepare_result = {
         "base_branch_confirmed": True,
@@ -409,7 +413,9 @@ def test_enforce_base_branch_gate_passes_when_only_submodules_changed():
 def test_enforce_base_branch_gate_still_blocks_true_dirty_tree():
     """When the prompt reports workspace_clean=false (parent-repo
     untracked/modified files remain after the submodule-ignore pass),
-    the gate must still raise."""
+    the gate must always raise — git_commit is forced on, so there is
+    no ``git_commit=False`` path that would relax this check.
+    """
     from turbo_optimize.manifest import ManifestError
 
     params = CampaignParams(
@@ -417,7 +423,6 @@ def test_enforce_base_branch_gate_still_blocks_true_dirty_tree():
         workspace_root=Path("/tmp/ws"),
         state_dir=Path("/tmp/ws/state"),
         skills_root=Path("/tmp/skills"),
-        git_commit=True,
     )
     prepare_result = {
         "base_branch_confirmed": True,
@@ -428,3 +433,29 @@ def test_enforce_base_branch_gate_still_blocks_true_dirty_tree():
     }
     with pytest.raises(ManifestError, match="workspace_clean=false"):
         campaign_mod._enforce_base_branch_gate(params, prepare_result)
+
+
+def test_enforce_base_branch_gate_always_checks_workspace_clean():
+    """Regression guard for the old behaviour where the workspace_clean
+    check was gated behind ``params.git_commit``. The gate must fire
+    even without any user-facing git_commit knob present."""
+    from turbo_optimize.manifest import ManifestError
+
+    params = CampaignParams(
+        prompt="opt gemm",
+        workspace_root=Path("/tmp/ws"),
+        state_dir=Path("/tmp/ws/state"),
+        skills_root=Path("/tmp/skills"),
+    )
+    assert not hasattr(params, "git_commit"), (
+        "CampaignParams must not carry a git_commit field; the value is "
+        "a module-level constant so the workspace-clean gate is always on."
+    )
+    with pytest.raises(ManifestError, match="workspace_clean=false"):
+        campaign_mod._enforce_base_branch_gate(
+            params,
+            {
+                "base_branch_confirmed": True,
+                "workspace_clean": False,
+            },
+        )

@@ -159,8 +159,9 @@ to `fwd_avg` when `bwd_avg` is null); you may leave it `null` and the
 orchestrator will compute it.
 
 Forbidden:
-- Do NOT commit to git here. The orchestrator runs `git commit` after the
-  Python-side decision confirms ACCEPT and `git_commit=true`.
+- Do NOT commit to git here. The orchestrator runs `git commit`
+  automatically after the Python-side decision confirms ACCEPT
+  (git_commit is forced on for every campaign; no opt-out).
 - Do NOT edit `logs/optimize.md` or `logs/performance_trend.md` in this
   phase. The orchestrator appends structured rows post-decision.
 

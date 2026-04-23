@@ -166,16 +166,6 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--git-commit",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Whether the orchestrator runs `git commit` after each ACCEPTED "
-            "round. Default: --no-git-commit (off). Overrides any "
-            "`git_commit` value Claude writes into manifest.yaml."
-        ),
-    )
-    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Plan-only mode: print phase plan without connecting to Claude.",
@@ -241,7 +231,6 @@ def _build_params(args: argparse.Namespace) -> CampaignParams:
         max_duration=args.max_duration,
         debug_retry=args.debug_retry,
         base_branch=args.base_branch,
-        git_commit=args.git_commit,
         dry_run=args.dry_run,
     )
 

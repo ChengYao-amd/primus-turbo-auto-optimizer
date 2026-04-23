@@ -70,6 +70,11 @@ PHASE_TIMEOUT_DEFAULTS: dict[str, dict[str, object]] = {
     "VALIDATE":             {"idle": 1500, "wall": 7200, "retries": 0, "retriable": False},
     "VALIDATE (quick)":     {"idle": 600,  "wall": 2400, "retries": 0, "retriable": False},
     "VALIDATE (full)":      {"idle": 1500, "wall": 7200, "retries": 0, "retriable": False},
+    # REVIEW is read-only (no bench/test/build). Idle covers the
+    # worst-case LLM latency when it has to cross-reference the quick
+    # + full CSVs; wall stays short because no subprocess can legitimately
+    # stretch this phase.
+    "REVIEW":               {"idle": 300,  "wall": 900,  "retries": 1, "retriable": True},
     "STAGNATION_REVIEW":    {"idle": 300,  "wall": 1200, "retries": 1, "retriable": True},
     "REPORT":               {"idle": 300,  "wall": 1200, "retries": 1, "retriable": True},
 }
@@ -141,8 +146,20 @@ class CampaignParams:
     profile_command: str | None = None
     related_work_file: str | None = None
 
-    git_commit: bool = False
-    git_branch: str = "auto"
+    # Git integration is non-negotiable for this campaign runner:
+    #   * every ACCEPTED round is committed so rollback can use
+    #     ``git reset --hard`` instead of the flat file-copy path
+    #     (:func:`turbo_optimize.orchestrator.campaign._rollback_kernel`
+    #     cannot restore nested subdirs, delete newly-added files, or
+    #     clear Triton/pycache artefacts);
+    #   * experiments always run on a dedicated ``optimize/<campaign_id>``
+    #     branch so the user's source branch stays untouched.
+    # ``git_commit`` and ``git_branch`` are therefore force-applied as
+    # module-level constants in :mod:`turbo_optimize.orchestrator.campaign`
+    # (:data:`FORCED_GIT_COMMIT` / :data:`FORCED_GIT_BRANCH`) and are not
+    # exposed as :class:`CampaignParams` fields. ``base_branch`` remains
+    # user-configurable — it names the upstream branch the optimize
+    # branch descends from.
     base_branch: str | None = None
     max_iterations: int | None = None
     max_duration: str | None = None
@@ -204,11 +221,12 @@ class CampaignParams:
         already supplied (e.g. `--max-iterations` override) win over the
         manifest; everything else is taken verbatim from the yaml.
 
-        ``git_commit`` and ``base_branch`` are CLI-authoritative: the CLI
-        value always wins when provided.  ``git_commit`` is excluded from
-        the mapping entirely (default ``False``); ``base_branch`` is in
-        the mapping but is skipped when the CLI already set it to a
-        non-empty value.
+        ``base_branch`` is CLI-authoritative: the CLI value always wins
+        when provided, otherwise the manifest value is used.
+        ``git_commit`` / ``git_branch`` are not in the mapping at all —
+        they are module-level constants (see :class:`CampaignParams`
+        docstring) and any such keys in manifest.yaml are silently
+        ignored.
         """
         mapping = {
             "target_op": "target_op",
@@ -226,7 +244,6 @@ class CampaignParams:
             "quick_command": "quick_command",
             "profile_command": "profile_command",
             "related_work_file": "related_work_file",
-            "git_branch": "git_branch",
             "base_branch": "base_branch",
             "project_skill": "project_skill",
         }

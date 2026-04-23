@@ -51,6 +51,7 @@ from turbo_optimize.orchestrator.phases import (
     profile as profile_phase,
     read_historical_tips,
     report as report_phase,
+    review as review_phase,
     stagnation_review,
     survey_related_work,
     validate as validate_phase,
@@ -58,10 +59,17 @@ from turbo_optimize.orchestrator.phases import (
 from turbo_optimize.scoring import (
     BenchmarkParse,
     DecisionResult,
+    REVIEW_VERDICT_AGREE,
+    REVIEW_VERDICT_DOWNGRADE_TO_NOISE_BOUND,
+    REVIEW_VERDICT_DOWNGRADE_TO_ROLLBACK,
+    REVIEW_VERDICT_ESCALATE_HUMAN,
+    ReviewBundle,
     ScoreVector,
     ScoringError,
     ShapeResult,
     check_hypothesis_duplicate,
+    compute_review_signals,
+    compute_score_vector,
     decide_accept_rollback,
     parse_bench_csv,
     split_primary_metric,
@@ -83,6 +91,50 @@ from turbo_optimize.state import (
 
 
 log = logging.getLogger(__name__)
+
+
+# Git integration is module-level policy, not user-configurable:
+#   * every ACCEPTED round commits so the working tree can be recovered
+#     by ``git reset --hard`` (the file-copy rollback path
+#     :func:`_rollback_kernel` cannot restore nested subdirs, delete
+#     newly-added files, or clear Triton JIT / pycache artefacts);
+#   * experiments run on a dedicated ``optimize/<campaign_id>`` branch
+#     so the user's source branch never accumulates throwaway commits.
+FORCED_GIT_COMMIT: bool = True
+FORCED_GIT_BRANCH: str = "auto"
+
+# REVIEW phase is currently hardcoded to tolerant mode: only the three
+# hard rules (hypothesis-metric alignment, off-target gain,
+# correctness-bit-identity) can downgrade an ACCEPT to a ROLLBACK.
+# Strict mode (where quick-vs-full and noise-band warnings also
+# downgrade) is intentionally not implemented yet — the user requested
+# review_tolerant only. Changing this constant to ``"strict"`` requires
+# the matching branch in :func:`turbo_optimize.scoring.compute_review_signals`.
+REVIEW_MODE: str = "tolerant"
+
+GIT_POLICY_EXPLANATION: str = (
+    "Git policy (forced, not user-configurable):\n"
+    f"  git_commit = {str(FORCED_GIT_COMMIT).lower()} — every ACCEPTED round "
+    "commits so rollback can use `git reset --hard` (file-copy "
+    "rollback alone cannot restore nested subdirs, delete newly-added "
+    "files, or clear Triton/pycache artefacts).\n"
+    f"  git_branch = {FORCED_GIT_BRANCH} — a dedicated branch "
+    "`optimize/<campaign_id>` is created off `base_branch` so "
+    "experiments never land on the user's source branch.\n"
+    "Any `git_commit` / `git_branch` entries in manifest.yaml are "
+    "ignored by the orchestrator."
+)
+
+
+def log_git_policy(campaign_stage: str) -> None:
+    """Emit the forced-git-policy explanation at a named pipeline stage.
+
+    Called from ``_phase_confirm_manifest`` and from the start of
+    ``_phase_prepare_environment`` so the reasoning for the policy is
+    reproducible in every campaign log.
+    """
+    for line in GIT_POLICY_EXPLANATION.splitlines():
+        log.info("[%s] %s", campaign_stage, line)
 
 
 class StagnationError(Exception):
@@ -405,11 +457,13 @@ async def _phase_confirm_manifest(params: CampaignParams, state: RunState) -> No
 
     params.merge_manifest(manifest)
     state.params = params.to_dict()
+    log_git_policy("MANIFEST_CONFIRM")
     advance_phase(state, "PREPARE_ENVIRONMENT")
     save_run_state(params.state_dir, state)
 
 
 async def _phase_prepare_environment(params: CampaignParams, state: RunState) -> None:
+    log_git_policy("PREPARE_ENVIRONMENT")
     outcome = await prepare_environment.run(params)
     result = outcome.structured or {}
     _enforce_base_branch_gate(params, result)
@@ -426,7 +480,9 @@ def _enforce_base_branch_gate(
     conditions and emitting ``base_branch_confirmed`` / ``workspace_clean``
     in the structured JSON. The orchestrator then enforces them so a
     hand-edited workspace can't silently produce commits on top of
-    uncontrolled base commits.
+    uncontrolled base commits. Because :data:`FORCED_GIT_COMMIT` is
+    always ``True``, the ``workspace_clean`` requirement is unconditional
+    — there is no opt-out path.
     """
     confirmed = prepare_result.get("base_branch_confirmed")
     expected = prepare_result.get("base_branch_expected")
@@ -437,10 +493,11 @@ def _enforce_base_branch_gate(
             f"HEAD is on '{observed}'. Fix the manifest or checkout "
             "the correct base before resuming."
         )
-    if params.git_commit and prepare_result.get("workspace_clean") is False:
+    if prepare_result.get("workspace_clean") is False:
         raise ManifestError(
-            "git_commit=true requires a clean workspace but PREPARE_ENVIRONMENT "
-            "reported workspace_clean=false. Stash or commit local edits and resume."
+            "git_commit is forced on (see FORCED_GIT_COMMIT) but "
+            "PREPARE_ENVIRONMENT reported workspace_clean=false. "
+            "Stash or commit local edits and resume."
         )
 
 
@@ -609,6 +666,7 @@ async def _run_round(params: CampaignParams, state: RunState) -> None:
 
     final_val_result = val_result
     final_decision = quick_decision
+    full_val_result: dict[str, Any] = {}
     if quick_decision.decision in ("ACCEPTED", "ACCEPT_PENDING_NOISE"):
         log.info(
             "round-%d quick decision=%s -> escalating to full validation",
@@ -634,6 +692,18 @@ async def _run_round(params: CampaignParams, state: RunState) -> None:
                 final_decision.decision,
                 final_decision.reason,
             )
+
+    if final_decision.decision in ("ACCEPTED", "ACCEPT_PENDING_NOISE"):
+        final_decision = await _run_review_phase(
+            params,
+            state,
+            round_n=round_n,
+            hypothesis=hypothesis,
+            opt_result=opt_result,
+            quick_val_result=val_result,
+            full_val_result=full_val_result or final_val_result,
+            decision=final_decision,
+        )
 
     _after_decision(
         params,
@@ -1023,6 +1093,232 @@ def _coerce_planned_files(value: Any) -> list[str]:
     return []
 
 
+async def _run_review_phase(
+    params: CampaignParams,
+    state: RunState,
+    *,
+    round_n: int,
+    hypothesis: dict[str, Any],
+    opt_result: dict[str, Any],
+    quick_val_result: dict[str, Any],
+    full_val_result: dict[str, Any],
+    decision: DecisionResult,
+) -> DecisionResult:
+    """Run REVIEW, merge its verdict into ``decision``.
+
+    Runs only after full-validation pronounced an ACCEPT-flavoured
+    decision. Builds the Python review bundle from the quick and full
+    CSVs, passes it into the phase runner, and then translates the
+    returned verdict via :func:`_apply_review_verdict`.
+
+    The phase is soft-wrapped in try/except: a failed REVIEW is
+    surfaced as an ERROR log but never crashes the round — we keep the
+    numeric decision intact because silently rejecting a good result
+    because the review plumbing broke would be worse than skipping the
+    check.
+    """
+    advance_phase(state, "REVIEW")
+    save_run_state(params.state_dir, state)
+
+    review_bundle = _build_review_bundle(
+        params,
+        hypothesis=hypothesis,
+        opt_result=opt_result,
+        quick_val_result=quick_val_result,
+        full_val_result=full_val_result,
+    )
+    decision_payload = {
+        "decision": decision.decision,
+        "reason": decision.reason,
+        "improvement_pct": dict(decision.improvement_pct),
+        "regressions": list(decision.regressions),
+        "noise_check_required": decision.noise_check_required,
+    }
+    try:
+        outcome = await review_phase.run(
+            params,
+            round_n=round_n,
+            hypothesis=hypothesis,
+            opt_result=opt_result,
+            quick_val_result=quick_val_result,
+            full_val_result=full_val_result,
+            decision=decision_payload,
+            review_bundle=review_bundle,
+        )
+        review_result = outcome.structured or {}
+    except Exception as exc:  # noqa: BLE001
+        log.exception(
+            "REVIEW phase failed for round-%d (%s); keeping numeric "
+            "decision %s as-is",
+            round_n,
+            exc,
+            decision.decision,
+        )
+        return decision
+
+    merged = _apply_review_verdict(decision, review_result, review_bundle)
+    log.info(
+        "round-%d REVIEW verdict=%s -> decision %s (reason: %s)",
+        round_n,
+        review_result.get("review_verdict"),
+        merged.decision,
+        merged.reason,
+    )
+    return merged
+
+
+def _build_review_bundle(
+    params: CampaignParams,
+    *,
+    hypothesis: dict[str, Any],
+    opt_result: dict[str, Any],
+    quick_val_result: dict[str, Any],
+    full_val_result: dict[str, Any],
+) -> ReviewBundle:
+    """Parse the quick / full CSVs and call :func:`compute_review_signals`.
+
+    The score vectors produced here feed both the REVIEW prompt (so
+    the LLM sees the same aggregated numbers the Python verdict was
+    built from) and the fallback payload when the LLM fails to emit a
+    valid verdict. Missing CSVs short-circuit cleanly: the relevant
+    signal is marked as "not available" rather than crashing the
+    phase.
+    """
+    primary_metric = params.primary_metric or "Forward TFLOPS"
+    quick_candidate = _parse_val_csv_to_score_vector(
+        params, quick_val_result.get("benchmark_csv"), primary_metric
+    )
+    full_candidate = _parse_val_csv_to_score_vector(
+        params, full_val_result.get("benchmark_csv"), primary_metric
+    )
+    baseline_best = _baseline_score_vector(params, primary_metric)
+    return compute_review_signals(
+        hypothesis=hypothesis,
+        opt_result=opt_result,
+        quick_val_result=quick_val_result,
+        full_val_result=full_val_result,
+        quick_candidate=quick_candidate,
+        full_candidate=full_candidate,
+        best=baseline_best,
+        primary_metric=primary_metric,
+        mode=REVIEW_MODE,
+    )
+
+
+def _parse_val_csv_to_score_vector(
+    params: CampaignParams,
+    csv_path_hint: Any,
+    primary_metric: str,
+) -> ScoreVector | None:
+    """Resolve a VALIDATE ``benchmark_csv`` hint to a ScoreVector.
+
+    Paths may arrive absolute (older runs) or relative to the campaign
+    directory (current prompt template). Missing / unparseable CSVs
+    return ``None`` so callers can continue with partial signal
+    coverage instead of forcing the phase to error out.
+    """
+    if not csv_path_hint or params.campaign_dir is None:
+        return None
+    raw = str(csv_path_hint)
+    path = Path(raw)
+    if not path.is_absolute():
+        path = params.campaign_dir / raw
+    if not path.exists():
+        log.debug("REVIEW: benchmark_csv %s does not exist on disk", path)
+        return None
+    try:
+        parse = parse_bench_csv(path, primary_metric)
+    except ScoringError as exc:
+        log.warning("REVIEW: could not parse %s: %s", path, exc)
+        return None
+    try:
+        return compute_score_vector(parse)
+    except ScoringError as exc:
+        log.warning("REVIEW: could not aggregate %s: %s", path, exc)
+        return None
+
+
+def _baseline_score_vector(
+    params: CampaignParams, primary_metric: str
+) -> ScoreVector | None:
+    """Build the score vector for BASELINE (round-1) in canonical form."""
+    if params.campaign_dir is None:
+        return None
+    path = params.campaign_dir / "rounds" / "round-1" / "artifacts" / "benchmark.csv"
+    if not path.exists():
+        return None
+    try:
+        parse = parse_bench_csv(path, primary_metric)
+        return compute_score_vector(parse)
+    except ScoringError as exc:
+        log.warning("REVIEW: could not build baseline score vector: %s", exc)
+        return None
+
+
+def _apply_review_verdict(
+    decision: DecisionResult,
+    review_result: dict[str, Any],
+    fallback: ReviewBundle,
+) -> DecisionResult:
+    """Translate the REVIEW verdict into a mutated ``DecisionResult``.
+
+    * ``AGREE`` — decision is kept verbatim, reason is left untouched.
+    * ``DOWNGRADE_TO_NOISE_BOUND`` — in tolerant mode the numeric
+      ACCEPT is preserved; we only annotate the reason so operators
+      see that REVIEW flagged at least one soft signal.
+    * ``DOWNGRADE_TO_ROLLBACK`` — force the decision to ROLLBACK with
+      the REVIEW reason prefix. No per-shape regressions are added;
+      the Python noise-band gate will still re-fire on the next
+      round's comparison against the (unchanged) baseline best.
+    * ``ESCALATE_HUMAN`` — also forces ROLLBACK but with a more
+      prominent reason so the operator can spot the correctness
+      concern in the optimize log.
+    """
+    verdict = review_result.get("review_verdict") or fallback.tolerant_verdict
+    review_reason = review_result.get("review_reason") or fallback.tolerant_reason
+    if verdict == REVIEW_VERDICT_AGREE:
+        return decision
+    if verdict == REVIEW_VERDICT_DOWNGRADE_TO_NOISE_BOUND:
+        return DecisionResult(
+            decision=decision.decision,
+            reason=(
+                f"{decision.reason} | REVIEW(tolerant)=DOWNGRADE_TO_NOISE_BOUND: "
+                f"{review_reason}"
+            ),
+            improvement_pct=decision.improvement_pct,
+            regressions=decision.regressions,
+            noise_check_required=True,
+        )
+    if verdict == REVIEW_VERDICT_DOWNGRADE_TO_ROLLBACK:
+        return DecisionResult(
+            decision="ROLLBACK",
+            reason=(
+                f"REVIEW(tolerant)=DOWNGRADE_TO_ROLLBACK: {review_reason} "
+                f"(prior numeric reason: {decision.reason})"
+            ),
+            improvement_pct=decision.improvement_pct,
+            regressions=decision.regressions,
+            noise_check_required=decision.noise_check_required,
+        )
+    if verdict == REVIEW_VERDICT_ESCALATE_HUMAN:
+        log.error(
+            "REVIEW escalated round to human: %s (decision rolled back)",
+            review_reason,
+        )
+        return DecisionResult(
+            decision="ROLLBACK",
+            reason=(
+                f"REVIEW(tolerant)=ESCALATE_HUMAN: {review_reason} "
+                "(correctness claim not verified; rolled back and logged)"
+            ),
+            improvement_pct=decision.improvement_pct,
+            regressions=decision.regressions,
+            noise_check_required=decision.noise_check_required,
+        )
+    log.warning("REVIEW returned unknown verdict %r; keeping decision", verdict)
+    return decision
+
+
 def _apply_decision(
     params: CampaignParams,
     state: RunState,
@@ -1140,7 +1436,7 @@ def _after_decision(
             best_score=aggregate,
             baseline_score=_baseline_score_from_state(state),
         )
-        _git_commit_if_enabled(params, round_n, hypothesis, decision)
+        _git_commit_round(params, round_n, hypothesis, decision)
         advance_phase(state, "TERMINATION_CHECK")
     elif decision.decision == "ACCEPT_PENDING_NOISE":
         log.info(
@@ -1192,7 +1488,7 @@ def _after_decision(
             best_score=aggregate,
             baseline_score=_baseline_score_from_state(state),
         )
-        _git_commit_if_enabled(params, round_n, hypothesis, decision)
+        _git_commit_round(params, round_n, hypothesis, decision)
         advance_phase(state, "TERMINATION_CHECK")
     else:
         state.rollback_streak += 1
@@ -1271,14 +1567,18 @@ def _rollback_kernel(
     log.info("rolled kernel back to round-%d snapshot at %s", best, src)
 
 
-def _git_commit_if_enabled(
+def _git_commit_round(
     params: CampaignParams,
     round_n: int,
     hypothesis: dict,
     decision: DecisionResult,
 ) -> None:
-    if not params.git_commit:
-        return
+    """Commit the accepted round to the optimize branch.
+
+    Git commit is forced on (:data:`FORCED_GIT_COMMIT`); there is no
+    opt-out. The commit is annotated with the hypothesis and the
+    measured improvement so the branch history doubles as an audit log.
+    """
     first = _format_improvement(decision.improvement_pct)
     msg = (
         f"[optimize] {params.target_op} {params.target_backend} "
@@ -1384,7 +1684,7 @@ def _merge_result_into_params(params: CampaignParams, result: dict) -> None:
             "execution_mode", "project_skill", "primary_metric",
             "performance_target", "target_shapes", "kernel_source",
             "test_command", "benchmark_command", "quick_command",
-            "git_commit", "git_branch", "max_iterations", "max_duration",
+            "base_branch", "max_iterations", "max_duration",
         }
     }
     if manifest_like:
