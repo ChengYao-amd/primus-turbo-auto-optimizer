@@ -49,9 +49,14 @@ class ShapeResult:
     shape: dict[str, Any]
     check: str
     metrics: dict[str, float]
+    metrics_stddev_pct: dict[str, float] = field(default_factory=dict)
+    repeats: int = 1
 
     def metric(self, name: str) -> float | None:
         return self.metrics.get(name)
+
+    def stddev_pct(self, name: str) -> float | None:
+        return self.metrics_stddev_pct.get(name)
 
 
 @dataclass
@@ -84,8 +89,43 @@ def split_primary_metric(primary_metric: str) -> list[str]:
     return parts or [DEFAULT_PRIMARY]
 
 
+_STDDEV_SUFFIXES: tuple[str, ...] = (
+    "_stddev_pct",
+    "_stddev",
+    "_std_pct",
+    "_std",
+)
+
+
+def _stddev_header_for(metric: str, headers: Iterable[str]) -> str | None:
+    header_set = set(headers)
+    for suffix in _STDDEV_SUFFIXES:
+        candidate = f"{metric}{suffix}"
+        if candidate in header_set:
+            return candidate
+    return None
+
+
+def _parse_float(raw: Any) -> float:
+    if raw is None or raw == "":
+        return float("nan")
+    try:
+        return float(raw)
+    except ValueError:
+        return float("nan")
+
+
 def parse_bench_csv(path: Path, primary_metric: str) -> BenchmarkParse:
-    """Parse a benchmark CSV. Assumes headers plus one row per shape."""
+    """Parse a benchmark CSV. Assumes headers plus one row per shape.
+
+    The parser recognises optional companion columns ``<Metric>_stddev``,
+    ``<Metric>_stddev_pct``, ``<Metric>_std``, ``<Metric>_std_pct``. When
+    any of those is present, it is attached to
+    ``ShapeResult.metrics_stddev_pct`` as a percentage — callers fall
+    back to the hard-coded noise threshold only when no column matches.
+    ``_stddev`` / ``_std`` columns are normalised into percentages using
+    the metric's mean in the same row.
+    """
     metrics = split_primary_metric(primary_metric)
     if not path.exists():
         raise ScoringError(f"benchmark CSV not found at {path}")
@@ -96,27 +136,45 @@ def parse_bench_csv(path: Path, primary_metric: str) -> BenchmarkParse:
             raise ScoringError(f"CSV has no header: {path}")
         headers = list(reader.fieldnames)
         shape_cols = _detect_shape_columns(headers, metrics)
+        stddev_columns = {
+            metric: _stddev_header_for(metric, headers) for metric in metrics
+        }
+        has_repeats_col = "repeats" in headers
         rows: list[ShapeResult] = []
         all_pass = True
         for raw in reader:
             metrics_in_row: dict[str, float] = {}
+            stddev_in_row: dict[str, float] = {}
             for metric in metrics:
-                val = raw.get(metric)
-                if val is None:
-                    metrics_in_row[metric] = float("nan")
+                mean_val = _parse_float(raw.get(metric))
+                metrics_in_row[metric] = mean_val
+                std_col = stddev_columns.get(metric)
+                if std_col is None:
                     continue
-                try:
-                    metrics_in_row[metric] = float(val)
-                except ValueError:
-                    metrics_in_row[metric] = float("nan")
+                std_val = _parse_float(raw.get(std_col))
+                if math.isnan(std_val):
+                    continue
+                if std_col.endswith(("_stddev", "_std")):
+                    if mean_val and not math.isnan(mean_val) and mean_val > 0:
+                        stddev_in_row[metric] = std_val / mean_val * 100.0
+                else:
+                    stddev_in_row[metric] = std_val
             check = str(raw.get(CHECK_COL, "")).strip().upper() or "UNKNOWN"
             if check != "PASS":
                 all_pass = False
+            repeats = 1
+            if has_repeats_col:
+                try:
+                    repeats = max(1, int(float(raw.get("repeats", 1) or 1)))
+                except (TypeError, ValueError):
+                    repeats = 1
             rows.append(
                 ShapeResult(
                     shape={col: raw.get(col) for col in shape_cols},
                     check=check,
                     metrics=metrics_in_row,
+                    metrics_stddev_pct=stddev_in_row,
+                    repeats=repeats,
                 )
             )
     return BenchmarkParse(
@@ -126,7 +184,12 @@ def parse_bench_csv(path: Path, primary_metric: str) -> BenchmarkParse:
 
 def _detect_shape_columns(headers: Iterable[str], metrics: Iterable[str]) -> list[str]:
     metric_set = set(metrics)
-    exclude = metric_set | {CHECK_COL}
+    companion_cols: set[str] = set()
+    for metric in metric_set:
+        for suffix in _STDDEV_SUFFIXES:
+            companion_cols.add(f"{metric}{suffix}")
+    companion_cols.add("repeats")
+    exclude = metric_set | {CHECK_COL} | companion_cols
     exclude |= {h for h in headers if _looks_like_metric(h) and h not in metric_set}
     return [h for h in headers if h not in exclude]
 
@@ -156,6 +219,22 @@ def geomean(values: Iterable[float]) -> float:
     if not filtered:
         return 0.0
     return math.exp(sum(math.log(v) for v in filtered) / len(filtered))
+
+
+def observed_noise_pct(score: ScoreVector, metrics: Iterable[str]) -> float:
+    """Largest per-shape stddev% observed across ``metrics``.
+
+    Returns 0.0 when no shape carried a stddev companion column, which
+    keeps the decision gate on the original static noise threshold.
+    """
+    worst: float = 0.0
+    for row in score.per_shape:
+        for metric in metrics:
+            std = row.metrics_stddev_pct.get(metric)
+            if std is None or math.isnan(std):
+                continue
+            worst = max(worst, float(std))
+    return worst
 
 
 def compare_score(
@@ -309,13 +388,23 @@ def decide_accept_rollback(
             noise_check_required=False,
         )
 
-    if 0 < best_delta < NOISE_THRESHOLD_PCT:
-        return DecisionResult(
-            decision="ACCEPT_PENDING_NOISE",
-            reason=(
+    observed_noise = observed_noise_pct(candidate, metrics)
+    effective_noise = max(NOISE_THRESHOLD_PCT, observed_noise * 2.0)
+    if 0 < best_delta < effective_noise:
+        if observed_noise > 0:
+            reason = (
+                f"improvement {best_delta:.2f}% < {effective_noise:.2f}% noise "
+                f"threshold (observed stddev {observed_noise:.2f}% x2); "
+                "require 3 re-measurements"
+            )
+        else:
+            reason = (
                 f"improvement {best_delta:.2f}% < {NOISE_THRESHOLD_PCT}% noise "
                 "threshold; require 3 re-measurements"
-            ),
+            )
+        return DecisionResult(
+            decision="ACCEPT_PENDING_NOISE",
+            reason=reason,
             improvement_pct=improvement,
             regressions=regressions,
             noise_check_required=True,
@@ -391,6 +480,20 @@ class DuplicateMatch:
     reason: str
     round: int | None
     similarity: float
+    file_overlap: float = 0.0
+    signal: str = "text"
+
+
+def _file_jaccard(a: Iterable[str], b: Iterable[str]) -> float:
+    set_a = {str(p).strip() for p in a if p}
+    set_b = {str(p).strip() for p in b if p}
+    if not set_a or not set_b:
+        return 0.0
+    inter = len(set_a & set_b)
+    union = len(set_a | set_b)
+    if union == 0:
+        return 0.0
+    return inter / union
 
 
 def check_hypothesis_duplicate(
@@ -398,24 +501,63 @@ def check_hypothesis_duplicate(
     verified_ineffective: list[dict[str, Any]] | list,
     *,
     threshold: float = 0.6,
+    planned_modified_files: list[str] | None = None,
+    file_overlap_threshold: float = 0.6,
 ) -> DuplicateMatch | None:
-    """Fuzzy match a new hypothesis against the verified ineffective list."""
+    """Fuzzy match a new hypothesis against the verified ineffective list.
+
+    Two signals are considered, either sufficient on its own to flag a
+    duplicate:
+
+    * **Textual similarity** of the hypothesis prose against the
+      historical ``direction`` string (the original v1 behaviour).
+    * **Modified-file overlap** — when ``planned_modified_files`` is
+      provided, a Jaccard >= ``file_overlap_threshold`` against the
+      historical entry's ``modified_files`` counts as a duplicate even
+      if the prose reads different. This catches the "reword the same
+      edit" failure mode where ANALYZE keeps re-proposing tweaks to
+      the same file block.
+
+    The match reports both scores plus ``signal`` = ``text`` /
+    ``files`` / ``both`` so the orchestrator can log which signal
+    fired.
+    """
+    planned_files = list(planned_modified_files or [])
     best: DuplicateMatch | None = None
     for entry in verified_ineffective:
         if hasattr(entry, "direction"):
             direction = entry.direction
             reason = entry.reason
             round_n = entry.round
+            files = getattr(entry, "modified_files", []) or []
         else:
             direction = entry.get("direction", "")
             reason = entry.get("reason", "")
             round_n = entry.get("round")
-        score = similarity(hypothesis, direction)
-        if score >= threshold and (best is None or score > best.similarity):
-            best = DuplicateMatch(
-                direction=direction,
-                reason=reason,
-                round=round_n,
-                similarity=score,
-            )
+            files = entry.get("modified_files") or []
+        text_score = similarity(hypothesis, direction)
+        file_score = _file_jaccard(planned_files, files) if planned_files else 0.0
+        text_hit = text_score >= threshold
+        file_hit = file_score >= file_overlap_threshold
+        if not (text_hit or file_hit):
+            continue
+        if text_hit and file_hit:
+            signal = "both"
+        elif text_hit:
+            signal = "text"
+        else:
+            signal = "files"
+        candidate = DuplicateMatch(
+            direction=direction,
+            reason=reason,
+            round=round_n,
+            similarity=text_score,
+            file_overlap=file_score,
+            signal=signal,
+        )
+        better = best is None or max(text_score, file_score) > max(
+            best.similarity, best.file_overlap
+        )
+        if better:
+            best = candidate
     return best

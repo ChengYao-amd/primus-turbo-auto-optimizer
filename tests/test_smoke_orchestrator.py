@@ -32,6 +32,7 @@ from turbo_optimize.orchestrator.phases import (
     define_target as define_target_phase,
     optimize as optimize_phase,
     prepare_environment as prepare_environment_phase,
+    profile as profile_phase,
     read_historical_tips as read_historical_tips_phase,
     report as report_phase,
     stagnation_review as stagnation_review_phase,
@@ -61,7 +62,9 @@ def _manifest_stub(campaign_dir: Path) -> dict[str, Any]:
         "kernel_source": "primus_turbo/triton/kernels/gemm_fp8_blockwise.py",
         "test_command": "pytest -q tests/test_gemm_fp8_blockwise.py",
         "benchmark_command": "python benchmarks/bench_gemm_fp8_blockwise.py --csv",
-        "quick_command": "python quick_test_bench.py",
+        "quick_command": "python ${CAMPAIGN_DIR}/quick_test_bench.py",
+        "profile_command": "python ${CAMPAIGN_DIR}/profile_op_shape.py",
+        "base_branch": "main",
         "git_commit": "deadbeef",
         "git_branch": "main",
         "max_iterations": None,
@@ -97,7 +100,16 @@ async def _fake_prepare_environment_run(params: CampaignParams):
     (params.campaign_dir / "rounds" / "round-1" / "kernel_snapshot").mkdir(
         parents=True, exist_ok=True
     )
-    result = {"snapshot_ok": True}
+    result = {
+        "snapshot_ok": True,
+        "base_branch_confirmed": True,
+        "base_branch_expected": "main",
+        "base_branch_observed": "main",
+        "base_commit_observed": "deadbeef",
+        "workspace_clean": True,
+        "submodule_state_ignored": True,
+        "submodule_state": " c26064254 3rdparty/composable_kernel (therock-7.10)",
+    }
     write_phase_result(params.state_dir, "PREPARE_ENVIRONMENT", result)
     return run_phase_module.PhaseOutcome(
         phase="PREPARE_ENVIRONMENT",
@@ -252,6 +264,7 @@ async def _fake_validate_run(
     *,
     round_n: int,
     validation_level: str,
+    force: bool = False,
 ):
     assert params.campaign_dir is not None
     _write_round_summary(
@@ -298,12 +311,45 @@ async def _fake_validate_run(
     )
 
 
-async def _fake_stagnation_run(params: CampaignParams, *, rollback_streak: int):
-    result = {"decision": "PROCEED", "notes": "mock stagnation review"}
+async def _fake_stagnation_run(
+    params: CampaignParams,
+    *,
+    rollback_streak: int,
+    current_round: int | None = None,
+):
+    result = {
+        "decision": "PROCEED",
+        "notes": "mock stagnation review",
+        "current_round": current_round,
+    }
     write_phase_result(params.state_dir, "STAGNATION_REVIEW", result)
     return run_phase_module.PhaseOutcome(
         phase="STAGNATION_REVIEW",
         messages_log=Path("/dev/null"),
+        structured=result,
+    )
+
+
+async def _fake_profile_run(
+    params: CampaignParams, *, round_n: int, trigger: str, force: bool = False
+):
+    assert params.campaign_dir is not None
+    result = {
+        "round": round_n,
+        "trigger": trigger,
+        "skipped": True,
+        "skip_reason": "rocprof tools not installed in smoke test",
+        "artifacts_dir": f"profiles/round-{round_n}_{trigger}",
+        "tools": [],
+    }
+    from turbo_optimize.state import phase_result_path as _prp
+
+    expected = _prp(params.state_dir, "PROFILE", round_n, suffix=trigger)
+    expected.parent.mkdir(parents=True, exist_ok=True)
+    expected.write_text(json.dumps(result), encoding="utf-8")
+    return run_phase_module.PhaseOutcome(
+        phase="PROFILE",
+        messages_log=params.campaign_dir / "profiles" / f"_pf_{round_n}_{trigger}.jsonl",
         structured=result,
     )
 
@@ -359,6 +405,7 @@ def patched_phases(monkeypatch):
     monkeypatch.setattr(optimize_phase, "run", _fake_optimize_run)
     monkeypatch.setattr(validate_phase, "run", _fake_validate_run)
     monkeypatch.setattr(stagnation_review_phase, "run", _fake_stagnation_run)
+    monkeypatch.setattr(profile_phase, "run", _fake_profile_run)
     monkeypatch.setattr(report_phase, "run", _fake_report_run)
     return None
 

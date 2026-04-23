@@ -13,6 +13,7 @@ current best — no Claude markdown parsing required.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -173,15 +174,38 @@ def append_round_entry(
     _append(optimize_log_path(campaign_dir), block)
 
 
+VERIFIED_INEFFECTIVE_SIDECAR = "verified_ineffective.jsonl"
+
+
 def append_verified_ineffective(
     campaign_dir: Path,
     *,
     round_n: int,
     direction: str,
     reason: str,
+    modified_files: list[str] | None = None,
 ) -> None:
+    """Append both the markdown row (human-readable) and a JSONL sidecar
+    row carrying the structured ``modified_files`` list.
+
+    The markdown row stays schema-stable so existing parsers keep
+    working; the sidecar is the source of truth for dedup because
+    Jaccard overlap on file paths is a stronger signal than textual
+    similarity of the hypothesis prose.
+    """
     row = f"| {direction} | round-{round_n} | {reason} |\n"
     _append(optimize_log_path(campaign_dir), row)
+
+    sidecar = campaign_dir / VERIFIED_INEFFECTIVE_SIDECAR
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "round": round_n,
+        "direction": direction,
+        "reason": reason,
+        "modified_files": list(modified_files or []),
+    }
+    with sidecar.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def append_final_report(campaign_dir: Path, body: str) -> None:
@@ -385,6 +409,7 @@ class IneffectiveDirection:
     round: int
     direction: str
     reason: str
+    modified_files: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -616,6 +641,42 @@ def _extract_scores_from_entry(block: str) -> dict[str, float]:
     return scores
 
 
+def _merge_modified_files_sidecar(
+    campaign_dir: Path, entries: list[IneffectiveDirection]
+) -> list[IneffectiveDirection]:
+    """Overlay ``modified_files`` from the JSONL sidecar onto parsed entries.
+
+    Matching is done on ``(round, direction)``; entries without a
+    matching sidecar row keep an empty ``modified_files`` list so older
+    campaigns still work.
+    """
+    sidecar = campaign_dir / VERIFIED_INEFFECTIVE_SIDECAR
+    if not sidecar.exists():
+        return entries
+    try:
+        lines = sidecar.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return entries
+    lookup: dict[tuple[int, str], list[str]] = {}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        key = (int(payload.get("round", 0) or 0), str(payload.get("direction", "")))
+        files = payload.get("modified_files") or []
+        if isinstance(files, list):
+            lookup[key] = [str(f) for f in files]
+    for entry in entries:
+        files = lookup.get((entry.round, entry.direction))
+        if files:
+            entry.modified_files = files
+    return entries
+
+
 def extract_history(campaign_dir: Path) -> History:
     optimize_text = ""
     trend_text = ""
@@ -629,6 +690,7 @@ def extract_history(campaign_dir: Path) -> History:
     rows = parse_trend_rows(trend_text)
     best_round, best_score = parse_current_best(optimize_text)
     verified = parse_verified_ineffective(optimize_text)
+    verified = _merge_modified_files_sidecar(campaign_dir, verified)
     directions = parse_directions_to_try(optimize_text)
 
     rollback_streak = 0

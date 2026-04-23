@@ -154,6 +154,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--base-branch",
+        default=None,
+        metavar="BRANCH",
+        help=(
+            "Branch that every OPTIMIZE commit descends from. Overrides "
+            "the `base_branch` value Claude writes into manifest.yaml. "
+            "The PREPARE_ENVIRONMENT gate rejects the campaign when the "
+            "working tree is not on this branch. Default: read from manifest "
+            "(which itself defaults to 'main')."
+        ),
+    )
+    parser.add_argument(
         "--git-commit",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -228,6 +240,7 @@ def _build_params(args: argparse.Namespace) -> CampaignParams:
         max_iterations=args.max_iterations,
         max_duration=args.max_duration,
         debug_retry=args.debug_retry,
+        base_branch=args.base_branch,
         git_commit=args.git_commit,
         dry_run=args.dry_run,
     )

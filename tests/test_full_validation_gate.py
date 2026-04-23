@@ -151,7 +151,7 @@ def test_quick_accept_plus_full_accept_finalizes_as_accepted(monkeypatch, tmp_pa
     ):
         return _outcome({"build_ok": True, "diff_summary": "pipelining"})
 
-    async def fake_validate(p, *, round_n, validation_level):
+    async def fake_validate(p, *, round_n, validation_level, force=False):
         validate_levels.append(validation_level)
         return _outcome(_validate_ok(validation_level, fwd=118.0, bwd=58.0))
 
@@ -186,7 +186,7 @@ def test_quick_accept_plus_full_fail_rolls_back(monkeypatch, tmp_path):
     ):
         return _outcome({"build_ok": True, "diff_summary": "dtype relax"})
 
-    async def fake_validate(p, *, round_n, validation_level):
+    async def fake_validate(p, *, round_n, validation_level, force=False):
         validate_levels.append(validation_level)
         if validation_level == "quick":
             return _outcome(_validate_ok(validation_level, fwd=120.0, bwd=60.0))
@@ -217,7 +217,7 @@ def test_rollback_skips_full_validation(monkeypatch, tmp_path):
     ):
         return _outcome({"build_ok": True, "diff_summary": "block size shrink"})
 
-    async def fake_validate(p, *, round_n, validation_level):
+    async def fake_validate(p, *, round_n, validation_level, force=False):
         validate_levels.append(validation_level)
         return _outcome(_validate_ok(validation_level, fwd=95.0, bwd=45.0))
 

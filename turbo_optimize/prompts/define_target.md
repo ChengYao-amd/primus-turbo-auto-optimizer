@@ -31,9 +31,10 @@ null, or inferred values):
   max_iterations: {cli_max_iterations}
   max_duration:   {cli_max_duration}
   git_commit:     {cli_git_commit}
+  base_branch:    {cli_base_branch}
 
 If any override is `null`, write YAML `null` (not `~`, not the string
-"null"). Never change these three fields on your own initiative.
+"null"). Never change these four fields on your own initiative.
 
 Your tasks:
 
@@ -49,13 +50,25 @@ Your tasks:
    fields: target_op, target_backend, target_lang, target_gpu,
    execution_mode, project_skill, performance_target, primary_metric,
    target_shapes, kernel_source, test_command, benchmark_command,
-   quick_command, representative_shapes (use an empty list or placeholder
-   if BASELINE has not yet selected them), related_work_file, git_commit,
-   git_branch, max_iterations, max_duration, created.
-   - `quick_command` placeholder: `python {campaign_dir}/quick_test_bench.py`.
-   - `related_work_file` placeholder: `{campaign_dir}/related_work.md`.
+   quick_command, profile_command, representative_shapes (use an empty
+   list or placeholder if BASELINE has not yet selected them),
+   related_work_file, base_branch, git_commit, git_branch,
+   max_iterations, max_duration, created.
+   - `quick_command`: write `python ${{CAMPAIGN_DIR}}/quick_test_bench.py`.
+     The literal `${{CAMPAIGN_DIR}}` is a variable that the orchestrator
+     expands at runtime; do NOT replace it with the actual path.
+   - `profile_command`:
+     write `python ${{CAMPAIGN_DIR}}/profile_op_shape.py`. Same rule —
+     keep the `${{CAMPAIGN_DIR}}` variable verbatim. Even if the current
+     environment lacks `rocprof`, still emit this template; the PROFILE
+     phase will degrade to a warning rather than crash.
+   - `related_work_file`: write `${{CAMPAIGN_DIR}}/related_work.md`.
    - `representative_shapes`: leave as an empty list `[]` (BASELINE will
      fill it).
+   - `base_branch`: use the value from the CLI overrides block above.
+     When the CLI value is `null`, default to `main`. This field is
+     mandatory — the orchestrator's PREPARE_ENVIRONMENT gate rejects
+     the campaign when it is missing.
    - `created`: today's timestamp in `YYYY-MM-DD HH:MM` format.
 4. Finally, use the Write tool to emit a JSON document at
    `{phase_result_path}` with exactly this schema:
@@ -74,7 +87,9 @@ Your tasks:
   "kernel_source": "<string>",
   "test_command": "<string>",
   "benchmark_command": "<string>",
-  "quick_command": "python {campaign_dir}/quick_test_bench.py",
+  "quick_command": "python ${{CAMPAIGN_DIR}}/quick_test_bench.py",
+  "profile_command": "python ${{CAMPAIGN_DIR}}/profile_op_shape.py",
+  "base_branch": "<from CLI override or 'main'>",
   "git_commit": true_or_false,
   "git_branch": "<auto|none|string>",
   "max_iterations": null_or_integer,
@@ -84,6 +99,8 @@ Your tasks:
     "test_command": true,
     "benchmark_command": true,
     "quick_command_template": true,
+    "profile_command_template": true,
+    "base_branch": true,
     "benchmark_output_format": true,
     "scoring_rules": true,
     "execution_mode": true,

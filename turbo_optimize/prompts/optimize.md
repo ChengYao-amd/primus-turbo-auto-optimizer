@@ -18,6 +18,15 @@ Input hypothesis from ANALYZE (round-{round_n}):
 {hypothesis_json}
 </hypothesis>
 {retry_context_block}
+When a `## Previous attempt #N failed` block is present above, treat the
+`failure_category` and `failure_summary` fields as authoritative: they
+come from the previous VALIDATE run's own classification, not from
+Python heuristics. Your fix MUST address the named category directly
+(e.g. a `runtime_oom` retry must shrink memory footprint, not re-tile
+for throughput). If the same category recurs, pick a different
+concrete edit than the one you already tried — re-emitting the same
+patch twice always loses the round.
+
 Campaign context:
 - kernel_source:    {kernel_source}
 - campaign_dir:     {campaign_dir}

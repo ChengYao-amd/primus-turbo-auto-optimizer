@@ -38,6 +38,7 @@ PHASE_ORDER: tuple[str, ...] = (
     "SURVEY_RELATED_WORK",
     "READ_HISTORICAL_TIPS",
     "BASELINE",
+    "PROFILE",
     "ANALYZE",
     "OPTIMIZE",
     "VALIDATE",

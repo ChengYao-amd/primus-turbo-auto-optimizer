@@ -61,6 +61,8 @@ def parse_bench_csv_impl(
                 "shape": row.shape,
                 "check": row.check,
                 "metrics": row.metrics,
+                "metrics_stddev_pct": row.metrics_stddev_pct,
+                "repeats": row.repeats,
             }
             for row in parse.rows
         ],

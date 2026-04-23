@@ -57,10 +57,12 @@ class CampaignParams:
     test_command: str | None = None
     benchmark_command: str | None = None
     quick_command: str | None = None
+    profile_command: str | None = None
     related_work_file: str | None = None
 
     git_commit: bool = False
     git_branch: str = "auto"
+    base_branch: str | None = None
     max_iterations: int | None = None
     max_duration: str | None = None
     debug_retry: int = 3
@@ -121,10 +123,11 @@ class CampaignParams:
         already supplied (e.g. `--max-iterations` override) win over the
         manifest; everything else is taken verbatim from the yaml.
 
-        ``git_commit`` is intentionally **not** in the mapping: it is a CLI-
-        authoritative switch (default ``False``) so users can't accidentally
-        re-enable commits by leaving ``git_commit: true`` in a hand-edited
-        manifest. Use ``--git-commit`` to turn it on.
+        ``git_commit`` and ``base_branch`` are CLI-authoritative: the CLI
+        value always wins when provided.  ``git_commit`` is excluded from
+        the mapping entirely (default ``False``); ``base_branch`` is in
+        the mapping but is skipped when the CLI already set it to a
+        non-empty value.
         """
         mapping = {
             "target_op": "target_op",
@@ -140,8 +143,10 @@ class CampaignParams:
             "test_command": "test_command",
             "benchmark_command": "benchmark_command",
             "quick_command": "quick_command",
+            "profile_command": "profile_command",
             "related_work_file": "related_work_file",
             "git_branch": "git_branch",
+            "base_branch": "base_branch",
             "project_skill": "project_skill",
         }
         for attr, key in mapping.items():
@@ -167,6 +172,25 @@ class CampaignParams:
         self.manifest_fields = {
             k: v for k, v in manifest.items() if not k.startswith("_")
         }
+
+        self._expand_campaign_vars()
+
+    def _expand_campaign_vars(self) -> None:
+        """Replace ``${CAMPAIGN_DIR}`` in command/path fields with the
+        actual campaign directory.
+
+        The manifest stores these fields as portable templates so that
+        ``manifest.yaml`` never embeds an absolute path.  Expansion
+        happens once, right after ``merge_manifest``, so every downstream
+        consumer sees fully-resolved paths.
+        """
+        if self.campaign_dir is None:
+            return
+        campaign_dir_str = str(self.campaign_dir)
+        for attr in ("quick_command", "profile_command", "related_work_file"):
+            value = getattr(self, attr)
+            if value and "${CAMPAIGN_DIR}" in value:
+                setattr(self, attr, value.replace("${CAMPAIGN_DIR}", campaign_dir_str))
 
 
 def make_campaign_id(prompt: str, *, now: datetime | None = None) -> str:

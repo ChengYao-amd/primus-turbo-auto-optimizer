@@ -181,6 +181,7 @@ def test_retry_recovers_after_build_fix(monkeypatch, tmp_path):
 
     attempts = {"optimize": 0}
     validate_levels: list[str] = []
+    validate_force_flags: list[bool] = []
     retry_contexts_seen: list[str | None] = []
 
     async def fake_analyze(p, *, round_n, retry_hint=None):
@@ -203,8 +204,9 @@ def test_retry_recovers_after_build_fix(monkeypatch, tmp_path):
             "notes": "missing import" if not build_ok else "built",
         })
 
-    async def fake_validate(p, *, round_n, validation_level):
+    async def fake_validate(p, *, round_n, validation_level, force=False):
         validate_levels.append(validation_level)
+        validate_force_flags.append(force)
         if attempts["optimize"] == 1:
             return _outcome(_validate_correctness_fail(round_n, validation_level))
         return _outcome(_validate_ok(round_n, validation_level, fwd=115.0, bwd=60.0))
@@ -219,6 +221,11 @@ def test_retry_recovers_after_build_fix(monkeypatch, tmp_path):
     assert "Previous attempt #1 failed" in retry_contexts_seen[1]
     assert "build_log" in retry_contexts_seen[1]
     assert validate_levels == ["quick", "quick", "full"]
+    # attempt 1 hits fresh JSON path (no cache bypass needed); attempt 2
+    # is a debug-retry → must force-refresh the stale quick JSON; the
+    # full-validation gate writes to a different suffix so it doesn't
+    # need force.
+    assert validate_force_flags == [False, True, False]
 
     assert state.best_round == 2
     last_event = state.history[-1]
@@ -232,6 +239,7 @@ def test_retry_exhausted_falls_through_to_rollback(monkeypatch, tmp_path):
 
     attempts = {"optimize": 0}
     validate_levels: list[str] = []
+    validate_force_flags: list[bool] = []
 
     async def fake_analyze(p, *, round_n, retry_hint=None):
         return _outcome({"primary_hypothesis": "vectorize loads"})
@@ -247,8 +255,9 @@ def test_retry_exhausted_falls_through_to_rollback(monkeypatch, tmp_path):
             "notes": "NameError",
         })
 
-    async def fake_validate(p, *, round_n, validation_level):
+    async def fake_validate(p, *, round_n, validation_level, force=False):
         validate_levels.append(validation_level)
+        validate_force_flags.append(force)
         return _outcome(_validate_correctness_fail(round_n, validation_level))
 
     _patch_phases(monkeypatch, fake_analyze, fake_optimize, fake_validate)
@@ -257,6 +266,9 @@ def test_retry_exhausted_falls_through_to_rollback(monkeypatch, tmp_path):
 
     assert attempts["optimize"] == 3  # 1 original + 2 retries
     assert validate_levels == ["quick", "quick", "quick"]  # no full gate reached
+    # Every retry past attempt 1 must force-refresh the quick JSON so
+    # the cached first-attempt FAIL is not silently replayed.
+    assert validate_force_flags == [False, True, True]
     last_event = state.history[-1]
     assert last_event["decision"] == "ROLLED BACK"
     assert state.best_round == 1
@@ -279,7 +291,7 @@ def test_regression_does_not_trigger_retry(monkeypatch, tmp_path):
         attempts["optimize"] += 1
         return _outcome({"build_ok": True, "diff_summary": "block size tweak"})
 
-    async def fake_validate(p, *, round_n, validation_level):
+    async def fake_validate(p, *, round_n, validation_level, force=False):
         validate_levels.append(validation_level)
         # correct but slower than baseline -> ROLLBACK via regression / no improvement
         return _outcome(_validate_ok(round_n, validation_level, fwd=180.0, bwd=80.0))
@@ -316,7 +328,7 @@ def test_debug_retry_zero_disables_retry(monkeypatch, tmp_path):
             "notes": "ptx compile error",
         })
 
-    async def fake_validate(p, *, round_n, validation_level):
+    async def fake_validate(p, *, round_n, validation_level, force=False):
         return _outcome(_validate_correctness_fail(round_n, validation_level))
 
     _patch_phases(monkeypatch, fake_analyze, fake_optimize, fake_validate)

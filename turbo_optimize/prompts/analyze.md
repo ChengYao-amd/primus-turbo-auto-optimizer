@@ -68,11 +68,20 @@ Tasks:
   "expected_benefit": "<e.g. +5% geomean>",
   "risks": ["<string>", ...],
   "verification_signal": "<string>",
+  "planned_modified_files": ["<repo-relative path>", ...],
   "rejected_alternatives": [
     {{"direction": "<string>", "reason": "<string>"}}
   ],
   "evidence_paths": ["<relative_path>", ...]
 }}
 ```
+
+`planned_modified_files` is MANDATORY. List every file OPTIMIZE will
+touch to implement this hypothesis. The orchestrator compares the
+Jaccard overlap of this list against every entry in
+`<verified_ineffective>`; a >= 0.6 overlap is treated as a duplicate
+even if the wording looks different, and ANALYZE will be re-prompted
+to pick another angle. Use repo-relative paths (as `git ls-files`
+prints them), not absolute paths.
 
 No chat. No code changes in this phase.

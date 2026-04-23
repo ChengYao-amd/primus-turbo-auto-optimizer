@@ -59,7 +59,29 @@ Tasks, in order:
    - Aggregate section
    - Decision placeholder — the orchestrator (Python) will finalise
      ACCEPT / ROLLED BACK after calling scoring.py.
-5. Emit structured phase result at `{phase_result_path}`:
+5. **Classify any failure BEFORE writing the JSON.** When
+   `correctness_ok` or `build_ok` is false (or about to be false), pick
+   exactly one `failure_category` from:
+   - `build_compile` — compiler / JIT rejected the source; captured in
+     the build log.
+   - `build_link` — link-time or codegen error; ROCm / HIP link log is
+     the source of truth.
+   - `runtime_assert` — kernel launched, then aborted via
+     `HIP_CHECK` / `TORCH_CHECK` / Python-level assert.
+   - `runtime_oom` — GPU memory exhaustion (look for
+     `hipErrorOutOfMemory` / `CUDA out of memory`).
+   - `runtime_hang` — kernel did not return within the harness timeout.
+   - `snr_fail` — kernel executed but SNR / max-abs-diff exceeded
+     threshold in `quick_test_bench.py`.
+   - `bench_regression` — all correctness checks pass but the
+     benchmark CSV still flagged `Check=FAIL` on at least one row.
+   - `other` — anything else; MUST include `failure_summary` detailing
+     the symptom.
+   Also fill `failure_summary` (<= 3 sentences) with: what the
+   observed symptom was, which log path proves it, and one candidate
+   hypothesis for what to try in the retry. This field is injected
+   verbatim into the next OPTIMIZE prompt — keep it mechanical.
+6. Emit structured phase result at `{phase_result_path}`:
 
 ```json
 {{
@@ -67,6 +89,9 @@ Tasks, in order:
   "validation_level": "{validation_level}",
   "correctness_ok": true_or_false,
   "build_ok": true_or_false,
+  "failure_category": "<one_of_the_categories_above_or_null_when_all_ok>",
+  "failure_summary": "<<=3_sentences_or_null>",
+  "failure_log_path": "<relative_path_or_null>",
   "benchmark_csv": "rounds/round-{round_n}/artifacts/benchmark.csv",
   "score_vector": [
     {{"shape": {{...}}, "check": "PASS", "metrics": {{
@@ -88,6 +113,11 @@ Tasks, in order:
   "notes": "<short>"
 }}
 ```
+
+On a healthy run (`correctness_ok=true` AND `build_ok=true`), set
+`failure_category` and `failure_summary` to `null`. On any failure,
+both MUST be populated — the orchestrator forwards them into the
+retry prompt.
 
 Populate both Forward and Backward TFLOPS when the kernel has a backward
 path. For inference-only kernels, set the backward fields to `null` — the

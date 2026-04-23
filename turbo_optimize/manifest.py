@@ -42,6 +42,8 @@ REQUIRED_FIELDS: tuple[str, ...] = (
     "test_command",
     "benchmark_command",
     "quick_command",
+    "profile_command",
+    "base_branch",
     "git_commit",
     "git_branch",
 )
@@ -126,6 +128,8 @@ def summarize_for_prompt(manifest: dict[str, Any]) -> str:
         "primary_metric",
         "performance_target",
         "target_shapes",
+        "profile_command",
+        "base_branch",
         "git_commit",
         "git_branch",
         "max_iterations",

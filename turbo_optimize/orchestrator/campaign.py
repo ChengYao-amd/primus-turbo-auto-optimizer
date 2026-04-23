@@ -45,6 +45,7 @@ from turbo_optimize.orchestrator.phases import (
     define_target,
     optimize as optimize_phase,
     prepare_environment,
+    profile as profile_phase,
     read_historical_tips,
     report as report_phase,
     stagnation_review,
@@ -403,9 +404,38 @@ async def _phase_confirm_manifest(params: CampaignParams, state: RunState) -> No
 
 
 async def _phase_prepare_environment(params: CampaignParams, state: RunState) -> None:
-    await prepare_environment.run(params)
+    outcome = await prepare_environment.run(params)
+    result = outcome.structured or {}
+    _enforce_base_branch_gate(params, result)
     advance_phase(state, "SURVEY_RELATED_WORK")
     save_run_state(params.state_dir, state)
+
+
+def _enforce_base_branch_gate(
+    params: CampaignParams, prepare_result: dict[str, Any]
+) -> None:
+    """Block the campaign when base_branch / workspace-clean gates fail.
+
+    The PREPARE_ENVIRONMENT prompt is responsible for detecting these
+    conditions and emitting ``base_branch_confirmed`` / ``workspace_clean``
+    in the structured JSON. The orchestrator then enforces them so a
+    hand-edited workspace can't silently produce commits on top of
+    uncontrolled base commits.
+    """
+    confirmed = prepare_result.get("base_branch_confirmed")
+    expected = prepare_result.get("base_branch_expected")
+    observed = prepare_result.get("base_branch_observed")
+    if confirmed is False:
+        raise ManifestError(
+            f"base_branch gate failed: manifest expects '{expected}', "
+            f"HEAD is on '{observed}'. Fix the manifest or checkout "
+            "the correct base before resuming."
+        )
+    if params.git_commit and prepare_result.get("workspace_clean") is False:
+        raise ManifestError(
+            "git_commit=true requires a clean workspace but PREPARE_ENVIRONMENT "
+            "reported workspace_clean=false. Stash or commit local edits and resume."
+        )
 
 
 async def _phase_survey(params: CampaignParams, state: RunState) -> None:
@@ -464,11 +494,67 @@ async def _phase_baseline(params: CampaignParams, state: RunState) -> None:
     state.current_round = 2
     advance_phase(state, "ANALYZE")
     save_run_state(params.state_dir, state)
+    await _run_profile_phase(params, state, round_n=1, trigger="post_baseline")
 
 
 async def _phase_stagnation(params: CampaignParams, state: RunState) -> None:
-    await stagnation_review.run(params, rollback_streak=state.rollback_streak)
+    await _run_profile_phase(
+        params, state, round_n=state.current_round, trigger="pre_stagnation"
+    )
+    await stagnation_review.run(
+        params,
+        rollback_streak=state.rollback_streak,
+        current_round=state.current_round,
+    )
     advance_phase(state, "TERMINATION_CHECK")
+    save_run_state(params.state_dir, state)
+
+
+async def _run_profile_phase(
+    params: CampaignParams,
+    state: RunState,
+    *,
+    round_n: int,
+    trigger: str,
+) -> None:
+    """Invoke PROFILE at ``trigger`` and tolerate missing rocprof tools.
+
+    The phase is advisory: even when it reports ``skipped=true`` (for
+    instance because ``rocprofv3`` is not installed on the host) the
+    orchestrator keeps going. We only log the situation so later
+    ANALYZE runs can see whether the profile was available.
+    """
+    previous_phase = state.current_phase
+    advance_phase(state, "PROFILE")
+    save_run_state(params.state_dir, state)
+    try:
+        outcome = await profile_phase.run(
+            params, round_n=round_n, trigger=trigger
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "PROFILE (%s, round-%d) raised %s; continuing without profile",
+            trigger,
+            round_n,
+            exc,
+        )
+    else:
+        result = outcome.structured or {}
+        if result.get("skipped"):
+            log.info(
+                "PROFILE (%s, round-%d) skipped: %s",
+                trigger,
+                round_n,
+                result.get("skip_reason") or "no reason given",
+            )
+        else:
+            log.info(
+                "PROFILE (%s, round-%d) wrote artifacts to %s",
+                trigger,
+                round_n,
+                result.get("artifacts_dir"),
+            )
+    advance_phase(state, previous_phase)
     save_run_state(params.state_dir, state)
 
 
@@ -536,8 +622,18 @@ async def _run_round(params: CampaignParams, state: RunState) -> None:
             )
 
     _after_decision(
-        params, state, round_n, hypothesis, final_val_result, final_decision
+        params,
+        state,
+        round_n,
+        hypothesis,
+        opt_result,
+        final_val_result,
+        final_decision,
     )
+    if final_decision.decision in ("ACCEPTED", "ACCEPT_PENDING_NOISE"):
+        await _run_profile_phase(
+            params, state, round_n=round_n, trigger="post_accept"
+        )
 
 
 async def _run_optimize_validate_with_retry(
@@ -559,6 +655,7 @@ async def _run_optimize_validate_with_retry(
     opt_result: dict = {}
     val_result: dict = {}
     quick_decision: DecisionResult | None = None
+    failure_history: list[dict] = _load_failure_ledger(params, round_n)
 
     for attempt in range(1, max_attempts + 1):
         advance_phase(state, "OPTIMIZE")
@@ -575,7 +672,10 @@ async def _run_optimize_validate_with_retry(
         advance_phase(state, "VALIDATE")
         save_run_state(params.state_dir, state)
         outcome = await validate_phase.run(
-            params, round_n=round_n, validation_level="quick"
+            params,
+            round_n=round_n,
+            validation_level="quick",
+            force=bool(retry_context),
         )
         val_result = outcome.structured or {}
 
@@ -586,28 +686,42 @@ async def _run_optimize_validate_with_retry(
         if not _is_retryable_bug(quick_decision):
             return opt_result, val_result, quick_decision
 
+        entry = _append_failure_ledger(
+            params,
+            round_n=round_n,
+            attempt=attempt,
+            val_result=val_result,
+            decision=quick_decision,
+        )
+        failure_history.append(entry)
+
         if attempt >= max_attempts:
             log.warning(
-                "round-%d debug-retry exhausted (%d/%d): last reason=%s",
+                "round-%d debug-retry exhausted (%d/%d): last reason=%s "
+                "last_category=%s",
                 round_n,
                 attempt,
                 max_attempts,
                 quick_decision.reason,
+                val_result.get("failure_category"),
             )
             return opt_result, val_result, quick_decision
 
         log.info(
-            "round-%d attempt %d/%d failed (%s); preparing retry_context",
+            "round-%d attempt %d/%d failed (%s, category=%s); "
+            "preparing retry_context",
             round_n,
             attempt,
             max_attempts,
             quick_decision.reason,
+            val_result.get("failure_category"),
         )
         retry_context = _build_retry_context(
             attempt=attempt,
             decision=quick_decision,
             opt_result=opt_result,
             val_result=val_result,
+            previous_failures=failure_history,
         )
 
     assert quick_decision is not None
@@ -642,17 +756,36 @@ def _build_retry_context(
     decision: DecisionResult,
     opt_result: dict,
     val_result: dict,
+    previous_failures: list[dict] | None = None,
 ) -> str:
     """Produce the markdown block Claude sees at the start of the next
     OPTIMIZE attempt.
 
-    Focused on pointers (log paths, failing shapes) rather than
-    freeform prose. The prompt wrapper around this block already tells
-    Claude to keep the hypothesis unchanged.
+    Focused on pointers (log paths, failing shapes, failure category)
+    rather than freeform prose. The VALIDATE phase now emits
+    ``failure_category`` + ``failure_summary`` on the phase_result JSON;
+    we surface both to the OPTIMIZE retry so the next attempt knows the
+    classification instead of re-deriving it from the raw log.
+
+    ``previous_failures`` is the accumulated history of attempt-level
+    classifications for this round. Including it lets the agent notice
+    that the same category keeps recurring and avoid the same edit
+    twice.
     """
     build_ok = bool(opt_result.get("build_ok", True))
+    category = val_result.get("failure_category")
+    summary = val_result.get("failure_summary")
+    fail_log = val_result.get("failure_log_path")
+
     lines = [f"## Previous attempt #{attempt} failed"]
     lines.append(f"- orchestrator reason: {decision.reason}")
+    if category:
+        lines.append(f"- failure_category: `{category}`")
+    if summary:
+        lines.append(f"- failure_summary: {summary}")
+    if fail_log:
+        lines.append(f"- failure_log_path: {fail_log}")
+
     if not build_ok:
         notes = opt_result.get("notes") or opt_result.get("diff_summary")
         if notes:
@@ -679,6 +812,24 @@ def _build_retry_context(
         bench = val_result.get("benchmark_csv")
         if bench:
             lines.append(f"- benchmark_csv: {bench}")
+
+    if previous_failures:
+        lines.append("")
+        lines.append("## Failure history in this round")
+        for fail in previous_failures[-3:]:
+            a = fail.get("attempt")
+            c = fail.get("category") or "?"
+            s = fail.get("summary") or ""
+            lines.append(f"- attempt-{a} category={c} — {s}")
+        seen = {fail.get("category") for fail in previous_failures if fail.get("category")}
+        if category and category in seen:
+            lines.append(
+                f"- NOTE: category `{category}` repeated across attempts; "
+                "change the edit direction instead of re-applying the "
+                "same fix verbatim."
+            )
+
+    lines.append("")
     lines.append(
         "Fix the concrete implementation bug (syntax error, API "
         "mismatch, off-by-one, wrong dtype, missing import, ...) and "
@@ -689,15 +840,76 @@ def _build_retry_context(
     return "\n".join(lines)
 
 
+def _append_failure_ledger(
+    params: CampaignParams,
+    *,
+    round_n: int,
+    attempt: int,
+    val_result: dict,
+    decision: DecisionResult,
+) -> dict:
+    """Persist a structured failure record under ``state_dir/failures/``.
+
+    The ledger survives resume — on warm restart the next retry can read
+    the whole history of attempts so it doesn't propose the same bad
+    fix Claude already tried three attempts ago.
+
+    Returns the appended entry so callers can also thread it into the
+    ``retry_context`` without re-reading from disk.
+    """
+    assert params.state_dir is not None
+    ledger_dir = params.state_dir / "failures"
+    ledger_dir.mkdir(parents=True, exist_ok=True)
+    path = ledger_dir / f"round{round_n}.json"
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            existing = []
+    else:
+        existing = []
+
+    entry = {
+        "attempt": attempt,
+        "category": val_result.get("failure_category"),
+        "summary": val_result.get("failure_summary"),
+        "log_path": val_result.get("failure_log_path"),
+        "orchestrator_reason": decision.reason,
+        "build_ok": bool(val_result.get("build_ok", True)),
+        "correctness_ok": bool(val_result.get("correctness_ok", False)),
+    }
+    existing.append(entry)
+    path.write_text(
+        json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return entry
+
+
+def _load_failure_ledger(
+    params: CampaignParams, round_n: int
+) -> list[dict]:
+    """Read the round's accumulated failure history (empty if absent)."""
+    path = params.state_dir / "failures" / f"round{round_n}.json"
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+
+
 def _rewind_if_needed(state: RunState) -> None:
     """On resume, rewind mid-round phases back to ANALYZE for the same round_n.
 
     Round numbers must stay stable (SKILL requires monotonic rounds),
     so we keep current_round untouched and only reset the sub-phase.
     OPTIMIZE / VALIDATE side effects are idempotent at the file layer
-    (summary.md / kernel_snapshot are overwritten on re-run).
+    (summary.md / kernel_snapshot are overwritten on re-run). PROFILE
+    is an advisory sibling of ANALYZE; if we crashed inside PROFILE the
+    safest resume point is ANALYZE too — the re-run of PROFILE through
+    the round trigger overwrites the partial artifacts.
     """
-    mid_round = {"OPTIMIZE", "VALIDATE", "DECIDE"}
+    mid_round = {"OPTIMIZE", "VALIDATE", "DECIDE", "PROFILE"}
     if state.current_phase in mid_round and state.current_round > 0:
         log.info(
             "resume: rewind %s (round-%d) back to ANALYZE",
@@ -744,30 +956,57 @@ async def _analyze_with_dedup(
         )
         result = outcome.structured or {}
         history = extract_history(params.campaign_dir)  # type: ignore[arg-type]
+        planned_files = _coerce_planned_files(result.get("planned_modified_files"))
         match = check_hypothesis_duplicate(
             result.get("primary_hypothesis", ""),
             history.verified_ineffective,
+            planned_modified_files=planned_files,
         )
         if match is None:
             return result
         log.warning(
             "ANALYZE retry %d: hypothesis matches verified_ineffective "
-            "round-%s reason=%s similarity=%.2f",
+            "round-%s signal=%s text_sim=%.2f file_overlap=%.2f reason=%s",
             attempt + 1,
             match.round,
-            match.reason,
+            match.signal,
             match.similarity,
+            match.file_overlap,
+            match.reason,
         )
-        retry_hint = (
+        hint_parts = [
             f"previous hypothesis '{result.get('primary_hypothesis')}' "
             f"overlaps with verified-ineffective entry "
-            f"(round-{match.round}: {match.direction}; reason: {match.reason}). "
-            "pick a substantially different direction."
-        )
+            f"(round-{match.round}: {match.direction}; reason: {match.reason})."
+        ]
+        if match.signal in ("files", "both") and match.file_overlap > 0:
+            hint_parts.append(
+                f"Modified-file overlap is {match.file_overlap:.2f} Jaccard "
+                "— the previous round touched the same files. Propose edits "
+                "in a different file or a different subsystem (e.g. grid "
+                "vs. tile vs. dtype) instead."
+            )
+        else:
+            hint_parts.append(
+                "Textual similarity is too high; rephrase the mechanism, not "
+                "just the wording."
+            )
+        hint_parts.append("Pick a substantially different direction.")
+        retry_hint = " ".join(hint_parts)
     raise StagnationError(
         "ANALYZE kept proposing duplicates against verified_ineffective; "
         "trigger STAGNATION_REVIEW"
     )
+
+
+def _coerce_planned_files(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if v]
+    if isinstance(value, str):
+        return [v.strip() for v in value.split(",") if v.strip()]
+    return []
 
 
 def _apply_decision(
@@ -816,11 +1055,13 @@ def _after_decision(
     state: RunState,
     round_n: int,
     hypothesis: dict,
+    opt_result: dict,
     val_result: dict,
     decision: DecisionResult,
 ) -> None:
     assert params.campaign_dir is not None
     aggregate = _coerce_score_dict(val_result.get("aggregate_score", {}))
+    modified_files = _coerce_planned_files(opt_result.get("modified_files"))
     description = hypothesis.get("primary_hypothesis", "n/a")
 
     if decision.decision == "ACCEPTED":
@@ -947,6 +1188,7 @@ def _after_decision(
             round_n=round_n,
             direction=description,
             reason=decision.reason,
+            modified_files=modified_files,
         )
         _rollback_kernel(params, state, round_n)
         if state.rollback_streak >= 2:

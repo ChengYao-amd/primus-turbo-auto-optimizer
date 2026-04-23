@@ -109,6 +109,7 @@ def load_skill_section(
             loc.workflow_md(),
             "Stagnation Detection and Conditional Intervention",
         ),
+        "PROFILE": (loc.workflow_md(), "ANALYZE"),
         "TERMINATION_CHECK": (loc.workflow_md(), "Termination Conditions"),
         "REPORT": (loc.workflow_md(), "ACCEPT / REPORT"),
         "ITERATION_RULES": (loc.rules_md(), "Core Principle"),

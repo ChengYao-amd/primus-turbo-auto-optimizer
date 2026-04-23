@@ -91,6 +91,77 @@ def test_merge_manifest_respects_explicit_git_commit_on():
     assert params.git_commit is True
 
 
+def test_base_branch_default_is_none():
+    args = _parse(["-p", "opt gemm"])
+    params = _build_params(args)
+    assert params.base_branch is None
+
+
+def test_base_branch_flag_sets_value():
+    args = _parse(["-p", "opt gemm", "--base-branch", "develop"])
+    params = _build_params(args)
+    assert params.base_branch == "develop"
+
+
+def test_base_branch_cli_overrides_manifest():
+    params = CampaignParams(
+        prompt="opt gemm",
+        workspace_root=Path("/tmp/ws"),
+        state_dir=Path("/tmp/ws/state"),
+        skills_root=Path("/tmp/skills"),
+        base_branch="develop",
+    )
+    params.merge_manifest({"target_op": "gemm", "base_branch": "main"})
+    assert params.base_branch == "develop"
+
+
+def test_base_branch_falls_back_to_manifest():
+    params = CampaignParams(
+        prompt="opt gemm",
+        workspace_root=Path("/tmp/ws"),
+        state_dir=Path("/tmp/ws/state"),
+        skills_root=Path("/tmp/skills"),
+    )
+    params.merge_manifest({"target_op": "gemm", "base_branch": "main"})
+    assert params.base_branch == "main"
+
+
+def test_expand_campaign_vars_replaces_placeholder():
+    params = CampaignParams(
+        prompt="opt gemm",
+        campaign_dir=Path("/workspace/campaign_001"),
+        workspace_root=Path("/workspace"),
+        state_dir=Path("/workspace/state"),
+        skills_root=Path("/workspace/skills"),
+    )
+    params.merge_manifest({
+        "target_op": "gemm",
+        "quick_command": "python ${CAMPAIGN_DIR}/quick_test_bench.py",
+        "profile_command": "python ${CAMPAIGN_DIR}/profile_op_shape.py",
+        "related_work_file": "${CAMPAIGN_DIR}/related_work.md",
+    })
+    assert params.quick_command == "python /workspace/campaign_001/quick_test_bench.py"
+    assert params.profile_command == "python /workspace/campaign_001/profile_op_shape.py"
+    assert params.related_work_file == "/workspace/campaign_001/related_work.md"
+
+
+def test_expand_campaign_vars_noop_without_placeholder():
+    params = CampaignParams(
+        prompt="opt gemm",
+        campaign_dir=Path("/workspace/campaign_001"),
+        workspace_root=Path("/workspace"),
+        state_dir=Path("/workspace/state"),
+        skills_root=Path("/workspace/skills"),
+    )
+    params.merge_manifest({
+        "target_op": "gemm",
+        "quick_command": "python quick_test_bench.py",
+        "profile_command": "python profile_op_shape.py",
+    })
+    assert params.quick_command == "python quick_test_bench.py"
+    assert params.profile_command == "python profile_op_shape.py"
+
+
 def test_yaml_value_renders_none_as_literal_null():
     assert _yaml_value(None) == "null"
     assert _yaml_value(3) == "3"
@@ -98,7 +169,7 @@ def test_yaml_value_renders_none_as_literal_null():
 
 
 def test_define_target_prompt_embeds_cli_overrides(tmp_path):
-    """render_prompt('define_target', ...) must inline the three CLI
+    """render_prompt('define_target', ...) must inline the four CLI
     override lines so Claude sees them in its context."""
     skill = "<skill-excerpt>"
     text = render_prompt(
@@ -114,9 +185,42 @@ def test_define_target_prompt_embeds_cli_overrides(tmp_path):
             "cli_max_iterations": _yaml_value(3),
             "cli_max_duration": _yaml_value(None),
             "cli_git_commit": "false",
+            "cli_base_branch": _yaml_value("develop"),
         },
     )
     assert "max_iterations: 3" in text
     assert "max_duration:   null" in text
     assert "git_commit:     false" in text
+    assert "base_branch:    develop" in text
     assert "AUTHORITATIVE" in text
+    assert "${CAMPAIGN_DIR}/quick_test_bench.py" in text, (
+        "quick_command placeholder must use ${CAMPAIGN_DIR} template variable"
+    )
+    assert "${CAMPAIGN_DIR}/profile_op_shape.py" in text, (
+        "profile_command placeholder must use ${CAMPAIGN_DIR} template variable"
+    )
+    assert "${CAMPAIGN_DIR}/related_work.md" in text, (
+        "related_work_file placeholder must use ${CAMPAIGN_DIR} template variable"
+    )
+
+
+def test_define_target_prompt_base_branch_null_when_unset(tmp_path):
+    """When CLI does not pass --base-branch, the prompt shows 'null'
+    so Claude falls back to its default ('main')."""
+    text = render_prompt(
+        "define_target",
+        {
+            "skill_excerpt": "x",
+            "user_prompt": "opt gemm",
+            "project_skill_path": "/p",
+            "project_skill": "p",
+            "campaign_dir": str(tmp_path),
+            "phase_result_path": str(tmp_path / "d.json"),
+            "manifest_path": str(tmp_path / "m.yaml"),
+            "cli_max_iterations": _yaml_value(None),
+            "cli_max_duration": _yaml_value(None),
+            "cli_git_commit": "false",
+            "cli_base_branch": _yaml_value(None),
+        },
+    )
+    assert "base_branch:    null" in text

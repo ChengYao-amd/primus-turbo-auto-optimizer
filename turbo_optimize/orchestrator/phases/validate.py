@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -33,11 +34,120 @@ ALLOWED_TOOLS = [
 ]
 
 
+_KNOWN_FAILURE_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "build_compile",
+        "build_link",
+        "runtime_assert",
+        "runtime_oom",
+        "runtime_hang",
+        "snr_fail",
+        "bench_regression",
+        "schema_invalid",
+        "other",
+    }
+)
+
+
+def _coerce_structured_result(
+    result: dict[str, Any] | None, *, round_n: int, level: str
+) -> dict[str, Any]:
+    """Ensure VALIDATE's structured JSON has the fields the scorer needs.
+
+    The orchestrator used to crash when a round wrote an empty or
+    half-populated phase_result (round-10 in the reference campaign).
+    We now normalise bad output into a well-formed ROLLBACK-looking
+    payload with ``failure_category="schema_invalid"`` so the standard
+    decision path can classify it instead of ``_apply_decision`` blowing
+    up on ``None`` scores.
+
+    The checks here are deliberately minimal — any deeper contract
+    (primary-metric presence, per-row shape/Check fields) still lives
+    in :mod:`turbo_optimize.scoring`.
+    """
+    if not isinstance(result, dict) or not result:
+        log.error(
+            "VALIDATE round-%d %s: phase_result empty or not a dict; "
+            "downgrading to schema_invalid",
+            round_n,
+            level,
+        )
+        return _schema_invalid_payload(round_n, level, "empty or non-dict JSON")
+
+    complaints: list[str] = []
+    score_vector = result.get("score_vector")
+    if not isinstance(score_vector, list) or len(score_vector) == 0:
+        complaints.append("score_vector empty or not a list")
+    aggregate = result.get("aggregate_score")
+    if not isinstance(aggregate, dict) or not aggregate:
+        complaints.append("aggregate_score empty or not a dict")
+    if not isinstance(result.get("correctness_ok"), bool):
+        complaints.append("correctness_ok missing or non-bool")
+    if not isinstance(result.get("build_ok"), bool):
+        result["build_ok"] = True
+
+    failure_category = result.get("failure_category")
+    if failure_category is not None and failure_category not in _KNOWN_FAILURE_CATEGORIES:
+        log.warning(
+            "VALIDATE round-%d: unknown failure_category=%r; coercing to 'other'",
+            round_n,
+            failure_category,
+        )
+        result["failure_category"] = "other"
+
+    if complaints:
+        log.error(
+            "VALIDATE round-%d %s phase_result fails schema: %s",
+            round_n,
+            level,
+            "; ".join(complaints),
+        )
+        base = _schema_invalid_payload(round_n, level, "; ".join(complaints))
+        base.update({k: v for k, v in result.items() if k not in base})
+        base["correctness_ok"] = False
+        base["failure_category"] = "schema_invalid"
+        base["failure_summary"] = (
+            "VALIDATE emitted an incomplete phase_result; the orchestrator "
+            "downgraded this round to ROLLBACK. Fix the VALIDATE step so it "
+            "always writes score_vector + aggregate_score before the JSON "
+            "is marked ready."
+        )
+        return base
+    return result
+
+
+def _schema_invalid_payload(round_n: int, level: str, reason: str) -> dict[str, Any]:
+    return {
+        "round": round_n,
+        "validation_level": level,
+        "correctness_ok": False,
+        "build_ok": True,
+        "failure_category": "schema_invalid",
+        "failure_summary": (
+            f"phase_result malformed ({reason}); treat this as a failed "
+            "VALIDATE with no usable score."
+        ),
+        "failure_log_path": None,
+        "benchmark_csv": None,
+        "score_vector": [],
+        "aggregate_score": {},
+        "trend_row": {
+            "fwd_avg": 0.0,
+            "fwd_peak": 0.0,
+            "bwd_avg": None,
+            "bwd_peak": None,
+            "step_geomean": None,
+        },
+        "notes": f"auto-downgraded by orchestrator: {reason}",
+    }
+
+
 async def run(
     params: CampaignParams,
     *,
     round_n: int,
     validation_level: str = "quick",
+    force: bool = False,
 ) -> PhaseOutcome:
     """Run one VALIDATE phase.
 
@@ -47,6 +157,12 @@ async def run(
     a quick ACCEPT it invokes this phase again with ``level=full`` and
     must *not* hit run_phase's cache-reuse shortcut on the quick JSON
     that was just produced.
+
+    ``force=True`` skips run_phase's cache-reuse shortcut even when the
+    expected JSON already exists on disk. Used by the OPTIMIZE+VALIDATE
+    debug-retry loop so that each retry's rewritten kernel is actually
+    re-validated instead of reading back the first attempt's failing
+    result.
     """
     assert params.campaign_dir is not None
     manifest = read_manifest(params.campaign_dir)
@@ -88,7 +204,7 @@ async def run(
         },
     )
     server = build_in_process_server(params)
-    return await run_phase(
+    outcome = await run_phase(
         PHASE,
         campaign_dir=params.campaign_dir,
         params=params,
@@ -102,6 +218,11 @@ async def run(
         mcp_servers={"turbo": server},
         expected_output=expected,
         max_turns=70,
+        force=force,
         round_n=round_n,
         phase_variant=validation_level,
     )
+    outcome.structured = _coerce_structured_result(
+        outcome.structured, round_n=round_n, level=validation_level
+    )
+    return outcome
