@@ -94,10 +94,14 @@ log = logging.getLogger(__name__)
 
 
 # Git integration is module-level policy, not user-configurable:
-#   * every ACCEPTED round commits so the working tree can be recovered
-#     by ``git reset --hard`` (the file-copy rollback path
-#     :func:`_rollback_kernel` cannot restore nested subdirs, delete
-#     newly-added files, or clear Triton JIT / pycache artefacts);
+#   * every ACCEPTED round commits so rollback can do
+#     ``git reset --hard HEAD`` + ``git clean -fd`` and recover the
+#     full workspace (see :func:`_git_rollback`). The pre-existing
+#     file-copy path in :func:`_rollback_kernel` only ever restored
+#     the single file at ``params.kernel_source`` and even wrote it
+#     to the wrong path (workspace root instead of the nested
+#     subdir), so it is now only used as a fallback when git is
+#     unavailable.
 #   * experiments run on a dedicated ``optimize/<campaign_id>`` branch
 #     so the user's source branch never accumulates throwaway commits.
 FORCED_GIT_COMMIT: bool = True
@@ -115,9 +119,11 @@ REVIEW_MODE: str = "tolerant"
 GIT_POLICY_EXPLANATION: str = (
     "Git policy (forced, not user-configurable):\n"
     f"  git_commit = {str(FORCED_GIT_COMMIT).lower()} — every ACCEPTED round "
-    "commits so rollback can use `git reset --hard` (file-copy "
-    "rollback alone cannot restore nested subdirs, delete newly-added "
-    "files, or clear Triton/pycache artefacts).\n"
+    "commits; rollback is `git reset --hard HEAD` + `git clean -fd` + "
+    "`git submodule update --recursive`, which reverts all modified "
+    "tracked files, deletes untracked files at any depth, and pulls "
+    "submodule pointers back to HEAD. The legacy snapshot-copy path "
+    "is kept only as a fallback when git is unavailable.\n"
     f"  git_branch = {FORCED_GIT_BRANCH} — a dedicated branch "
     "`optimize/<campaign_id>` is created off `base_branch` so "
     "experiments never land on the user's source branch.\n"
@@ -325,7 +331,7 @@ async def run_campaign(params: CampaignParams) -> int:
     _namespace_state_dir(params)
     _migrate_stray_phase_results(params)
     state, resumed = load_or_init_run(params)
-    _rewind_if_needed(state)
+    _rewind_if_needed(state, params)
     _resolve_model_settings(params, state, resumed)
     warm_restart.write_script(params)
     if params.campaign_dir is not None:
@@ -982,7 +988,7 @@ def _load_failure_ledger(
         return []
 
 
-def _rewind_if_needed(state: RunState) -> None:
+def _rewind_if_needed(state: RunState, params: CampaignParams) -> None:
     """On resume, rewind mid-round phases back to ANALYZE for the same round_n.
 
     Round numbers must stay stable (SKILL requires monotonic rounds),
@@ -992,8 +998,18 @@ def _rewind_if_needed(state: RunState) -> None:
     is an advisory sibling of ANALYZE; if we crashed inside PROFILE the
     safest resume point is ANALYZE too — the re-run of PROFILE through
     the round trigger overwrites the partial artifacts.
+
+    A campaign that already reached ``DONE`` is also rewindable when the
+    user explicitly raised the budget on the new invocation (e.g.
+    ``warm_restart.sh -i 100`` after the previous run terminated at
+    ``round=50`` with ``max_iterations=50``).  In that case we drop back
+    to ``TERMINATION_CHECK``: the next loop iteration re-evaluates T1/T3/T4
+    against the new ``params`` and either advances to a fresh
+    ``ANALYZE`` round or terminates again with the same on-disk
+    artifacts (``final_report.md`` / ``optimize.md`` get overwritten on
+    the next ``_final_report``).
     """
-    mid_round = {"OPTIMIZE", "VALIDATE", "DECIDE", "PROFILE"}
+    mid_round = {"OPTIMIZE", "VALIDATE", "DECIDE", "PROFILE", "REVIEW"}
     if state.current_phase in mid_round and state.current_round > 0:
         log.info(
             "resume: rewind %s (round-%d) back to ANALYZE",
@@ -1001,6 +1017,44 @@ def _rewind_if_needed(state: RunState) -> None:
             state.current_round,
         )
         state.current_phase = "ANALYZE"
+        return
+
+    if state.current_phase == "DONE" and _can_extend_after_done(state, params):
+        log.info(
+            "resume: campaign was DONE at round=%d but new budgets "
+            "(max_iterations=%s, max_duration=%s) leave room; "
+            "rewinding to TERMINATION_CHECK",
+            state.current_round,
+            params.max_iterations,
+            params.max_duration,
+        )
+        state.current_phase = "TERMINATION_CHECK"
+
+
+def _can_extend_after_done(state: RunState, params: CampaignParams) -> bool:
+    """Whether the new ``params`` would NOT immediately re-trigger T3 / T4.
+
+    Only ``max_iterations`` (T3) and ``max_duration`` (T4) are
+    user-resettable on a warm restart; the other termination predicates
+    (target met / stagnation / SIGINT) live entirely in ``state`` and
+    cannot be overridden from the CLI.  This helper mirrors the T3/T4
+    branches of :func:`_termination_check` so the rewind decision stays
+    consistent with the next TERMINATION_CHECK pass.
+    """
+    if (
+        params.max_iterations is not None
+        and state.current_round >= params.max_iterations
+    ):
+        return False
+    if params.max_duration and state.started_at:
+        dur_s = _parse_duration_s(params.max_duration)
+        if dur_s is not None and _started_elapsed_s(state.started_at) >= dur_s:
+            return False
+    if params.max_iterations is None and not params.max_duration:
+        # Neither knob set: no signal that the user wants to extend; keep
+        # the campaign DONE rather than silently looping.
+        return False
+    return True
 
 
 def _resolve_model_settings(
@@ -1543,9 +1597,57 @@ def _after_decision(
 def _rollback_kernel(
     params: CampaignParams, state: RunState, round_n: int
 ) -> None:
+    """Revert the workspace to the last ACCEPTED commit.
+
+    Canonical path (git): ``FORCED_GIT_COMMIT=True`` guarantees every
+    accepted round lands as a commit on the ``optimize/<campaign_id>``
+    branch, so ``HEAD`` on that branch is always the last accepted
+    state. The rollback is then just::
+
+        git reset --hard HEAD
+        git clean -fd
+        git submodule update --recursive
+
+    which reverts *all* modified tracked files (not only
+    ``kernel_source``), deletes *all* untracked files the failed round
+    emitted (including ones at unexpected paths like the repo root),
+    and pulls the submodule pointers back to their HEAD-pinned
+    commits. Before this change, the rollback path was a file-copy
+    from ``rounds/round-{best}/kernel_snapshot/``; that path only
+    restored the single file at ``params.kernel_source`` and wrote it
+    to ``workspace_root/<basename>`` (i.e. the repo root rather than
+    the original nested directory). The result was a slow-motion
+    working-tree corruption across consecutive rollbacks — exactly
+    the residue we found on campaign
+    ``optimize_grouped_gemm_fp8_tensorwise_triton_back_202604231519``
+    after rounds 4/5/6 rolled back and round 7 crashed without
+    rolling back. See ``docs/issue.md`` entries on "rollback leaves
+    foreign files" for the failure history.
+
+    Fallback path (file copy): kept for the pathological case where
+    ``workspace_root`` is not a git working tree (e.g. a test fixture
+    or a user who manually de-initialised git). A WARNING makes it
+    very visible because the fallback cannot restore nested dirs or
+    remove added files.
+    """
     assert params.campaign_dir is not None
+    workspace = params.workspace_root
+    if workspace is None:
+        log.warning("rollback skipped: workspace_root is unset")
+        return
+
+    if _git_rollback(workspace, state=state, round_n=round_n):
+        return
+
+    # --- fallback: snapshot-copy (known-broken; last resort only) ---
     best = state.best_round
     if best is None or params.kernel_source in (None, ""):
+        log.warning(
+            "rollback fell back to snapshot-copy but best_round=%s / "
+            "kernel_source=%r; nothing to do",
+            best,
+            params.kernel_source,
+        )
         return
     src = (
         params.campaign_dir
@@ -1556,15 +1658,117 @@ def _rollback_kernel(
     if not src.exists():
         log.warning("rollback skipped: best-round snapshot %s missing", src)
         return
-    dst_root = params.workspace_root
+    log.warning(
+        "rollback falling back to snapshot-copy for round-%d; "
+        "this cannot restore non-kernel files (C++, build artefacts, "
+        "untracked garbage). Fix by ensuring `%s` is a git working tree.",
+        round_n,
+        workspace,
+    )
     for f in src.rglob("*"):
         if not f.is_file():
             continue
         rel = f.relative_to(src)
-        target = dst_root / rel
+        target = workspace / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(f, target)
     log.info("rolled kernel back to round-%d snapshot at %s", best, src)
+
+
+def _git_rollback(
+    workspace: Path,
+    *,
+    state: RunState,
+    round_n: int,
+) -> bool:
+    """Run ``git reset --hard HEAD`` + ``git clean -fd`` inside ``workspace``.
+
+    Returns ``True`` if every git step succeeded, ``False`` if git is
+    unavailable or any command failed (so the caller can fall back to
+    the snapshot-copy path). Each subprocess is bounded by a short
+    timeout so a stuck git process cannot hang the phase.
+
+    Submodules are refreshed with ``git submodule update --recursive``
+    and then scrubbed with ``git submodule foreach --recursive
+    'git reset --hard && git clean -fd'`` so that 3rdparty checkouts
+    (the Primus-Turbo repo ships ``3rdparty/composable_kernel`` as a
+    submodule) both return to their HEAD-pinned commit AND drop any
+    untracked files a failed round may have dumped inside them. The
+    foreach step is what caught the real-world incident on the
+    2026-04-23 campaign where rounds 4-6 left 40+ generated
+    ``*_hip.hpp`` headers inside ``3rdparty/composable_kernel`` that
+    the plain ``submodule update`` step would otherwise preserve.
+    """
+    if not (workspace / ".git").exists():
+        log.warning(
+            "rollback: %s has no .git directory; falling back to snapshot-copy",
+            workspace,
+        )
+        return False
+
+    best = state.best_round
+    best_str = f"round-{best}" if best is not None else "baseline"
+    log.info(
+        "rollback: git-reset workspace %s back to HEAD (= %s, last ACCEPTED)",
+        workspace,
+        best_str,
+    )
+    steps: list[tuple[list[str], float]] = [
+        (["git", "reset", "--hard", "HEAD"], 30.0),
+        (["git", "clean", "-fd"], 30.0),
+        (["git", "submodule", "update", "--recursive"], 120.0),
+        (
+            [
+                "git",
+                "submodule",
+                "foreach",
+                "--recursive",
+                "git reset --hard && git clean -fd",
+            ],
+            120.0,
+        ),
+    ]
+    for argv, timeout_s in steps:
+        try:
+            subprocess.run(
+                argv,
+                cwd=str(workspace),
+                check=True,
+                timeout=timeout_s,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            log.warning(
+                "rollback: `git` executable not on PATH; falling back to "
+                "snapshot-copy (fix PATH to enable the canonical rollback)"
+            )
+            return False
+        except subprocess.TimeoutExpired:
+            log.warning(
+                "rollback: `%s` exceeded %.0fs timeout in %s; "
+                "falling back to snapshot-copy",
+                " ".join(argv),
+                timeout_s,
+                workspace,
+            )
+            return False
+        except subprocess.CalledProcessError as exc:
+            log.warning(
+                "rollback: `%s` failed (rc=%s) in %s: %s; "
+                "falling back to snapshot-copy",
+                " ".join(argv),
+                exc.returncode,
+                workspace,
+                (exc.stderr or "").strip().splitlines()[:3],
+            )
+            return False
+    log.info(
+        "rollback: workspace %s clean at HEAD (round-%d changes discarded)",
+        workspace,
+        round_n,
+    )
+    return True
 
 
 def _git_commit_round(

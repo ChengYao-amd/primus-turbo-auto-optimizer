@@ -42,18 +42,25 @@ def test_report_phase_mounts_mcp_turbo_server():
     assert "mcp_servers" in src, "REPORT must pass mcp_servers to run_phase"
 
 
-def test_report_phase_raises_max_turns_for_distillation():
-    """Tip distillation + final report + MCP round-trips don't fit in
-    30 turns; REPORT max_turns should be at least 50."""
+def test_report_phase_does_not_set_max_turns():
+    """Turn caps are intentionally removed from every phase runner.
+
+    The original motivation for this test was the opposite — REPORT
+    needed a generous ``max_turns`` so tip distillation would not get
+    truncated at turn 30. That problem is now handled more bluntly by
+    not passing ``max_turns`` at all, which lets the Claude CLI fall
+    back to its ``unlimited`` default. Cost control lives in
+    ``PHASE_TIMEOUT_DEFAULTS`` (``wall_timeout_s``) instead of a
+    per-phase turn counter; see ``turbo_optimize/config.py``.
+    """
     src = inspect.getsource(report_phase.run)
     import re
 
-    match = re.search(r"max_turns\s*=\s*(\d+)", src)
-    assert match is not None, "REPORT must set max_turns explicitly"
-    value = int(match.group(1))
-    assert value >= 50, (
-        f"REPORT max_turns={value} is too tight once tip distillation "
-        f"is added; expected >= 50"
+    assert re.search(r"max_turns\s*=", src) is None, (
+        "REPORT.run must NOT pass max_turns to run_phase; the campaign "
+        "runner relies on the SDK's unlimited default and bounds cost "
+        "via wall_timeout_s instead. If you are intentionally "
+        "reintroducing a turn cap, add a justification here."
     )
 
 

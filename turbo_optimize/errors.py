@@ -74,3 +74,40 @@ class PhaseWallTimeout(PhaseTimeout):
     Never retried: wall expiration means the whole budget for the
     phase is spent, including any retries that already ran.
     """
+
+
+class PhaseExpectedOutputMissing(Exception):
+    """Raised when a phase session finishes without writing the expected JSON.
+
+    Symptom observed in round-7 OPTIMIZE (2026-04-23): the Claude
+    session closed cleanly (either on ``max_turns`` exhaustion or
+    because the model decided it was "done"), every other side-effect
+    of the round was on disk (kernel edits, rebuild, libraries), but
+    the structured ``phase_result/*.json`` expected by
+    :func:`_load_expected_output` was absent. The old behaviour was
+    to throw :class:`FileNotFoundError` and kill the campaign, burning
+    every dollar the session cost.
+
+    This exception is the recoverable variant: the wrap-up recovery
+    layer in :func:`turbo_optimize.orchestrator.run_phase._execute_phase`
+    raises it only after its own bounded recovery attempts also failed
+    to produce the file. Callers may catch it to mark the round as a
+    rollback instead of aborting the whole campaign.
+    """
+
+    def __init__(
+        self,
+        phase: str,
+        expected_output: object,
+        recovery_attempts: int,
+    ) -> None:
+        self.phase = phase
+        self.expected_output = expected_output
+        self.recovery_attempts = int(recovery_attempts)
+        super().__init__(
+            f"{phase} produced no output at {expected_output} after "
+            f"{self.recovery_attempts} wrap-up recovery attempt(s); "
+            "the session ended cleanly but never emitted the required "
+            "JSON Write. Inspect the phase transcript to see whether "
+            "the model stopped on its own or was cut off."
+        )

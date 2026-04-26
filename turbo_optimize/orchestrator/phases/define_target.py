@@ -84,5 +84,4 @@ async def run(params: CampaignParams) -> PhaseOutcome:
         ),
         allowed_tools=ALLOWED_TOOLS,
         expected_output=expected,
-        max_turns=40,
     )

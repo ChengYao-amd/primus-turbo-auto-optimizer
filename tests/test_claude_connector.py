@@ -6,14 +6,17 @@ when ``euid == 0``. Inside containers we're already sandboxed and exporting
 ``IS_SANDBOX=1`` is Anthropic's documented opt-in. The connector must
 insert that flag automatically so callers don't have to remember.
 
-Also covers the Bash-aware idle extension introduced after the 2026-04-23
-``VALIDATE (full)`` false-positive: when the most recent ``AssistantMessage``
-declared a Bash tool_use carrying an explicit ``timeout``, the next
-``__anext__`` on the SDK stream is waited on with
-``max(idle_timeout_s, bash_timeout_s) + BASH_IDLE_SLACK_S`` so a
-long-running Bash (pytest, 288-shape benchmark, rocprof) cannot trip
-:class:`asyncio.TimeoutError` purely because its native ``timeout``
-exceeds the phase-level ``idle_timeout_s``.
+Also covers the long-running-tool-aware idle extension introduced after
+two false-positives:
+
+* 2026-04-23 ``VALIDATE (full)`` — a 498s ``pytest`` dominated a 360s
+  idle budget; the original Bash-only extension fixed this.
+* 2026-04-25 ``VALIDATE (quick)`` — a ``TaskOutput timeout=600000``
+  (CLI hard-cap) ran to its full 600s native limit and the bare 600s
+  idle fired at elapsed=600.1s, because the Bash-only helper ignored
+  the ``TaskOutput`` block.  The current implementation extends to
+  ``Bash`` / ``BashOutput`` / ``TaskOutput`` and waits on
+  ``max(idle_timeout_s, tool_timeout_s) + LONG_RUNNING_IDLE_SLACK_S``.
 """
 
 from __future__ import annotations
@@ -36,7 +39,9 @@ from turbo_optimize.model_connnector import claude_code_connector as connector_m
 from turbo_optimize.model_connnector.claude_code_connector import (
     BASH_IDLE_SLACK_S,
     ClaudeCodeConnector,
+    LONG_RUNNING_IDLE_SLACK_S,
     _extract_pending_bash_timeout_s,
+    _extract_pending_long_running_timeout_s,
     _needs_sandbox_flag,
 )
 
@@ -109,7 +114,12 @@ def test_needs_sandbox_flag_pure(monkeypatch):
 
 
 def _bash_assistant(bash_timeout_ms: int | None, *, name: str = "Bash") -> AssistantMessage:
-    """Build a minimal AssistantMessage with one tool_use block."""
+    """Build a minimal AssistantMessage with one tool_use block.
+
+    Despite the name, ``name`` is configurable so the same helper can
+    construct ``BashOutput`` / ``TaskOutput`` fixtures for the
+    long-running-tool tests below.
+    """
     input_payload: dict[str, object] = {"command": "echo hi"}
     if bash_timeout_ms is not None:
         input_payload["timeout"] = bash_timeout_ms
@@ -119,29 +129,50 @@ def _bash_assistant(bash_timeout_ms: int | None, *, name: str = "Bash") -> Assis
     )
 
 
-def test_extract_pending_bash_timeout_happy_path():
+def test_extract_pending_long_running_timeout_bash_happy_path():
     msg = _bash_assistant(600_000)
-    assert _extract_pending_bash_timeout_s(msg) == 600.0
+    assert _extract_pending_long_running_timeout_s(msg) == 600.0
 
 
-def test_extract_pending_bash_timeout_non_bash_tool_is_zero():
+def test_extract_pending_long_running_timeout_task_output_happy_path():
+    """``TaskOutput`` is the 2026-04-25 regression case: agent uses
+    ``Task`` to spawn a subagent, then ``TaskOutput block=true
+    timeout=…`` to wait on it.  The block is genuinely silent on the
+    SDK stream for the full ``timeout``, so the idle budget MUST be
+    extended even though the tool is not ``Bash``."""
+    msg = _bash_assistant(600_000, name="TaskOutput")
+    assert _extract_pending_long_running_timeout_s(msg) == 600.0
+
+
+def test_extract_pending_long_running_timeout_bash_output_happy_path():
+    """``BashOutput`` blocks polling on a backgrounded ``Bash``; same
+    silent-stream semantics as ``TaskOutput``."""
+    msg = _bash_assistant(120_000, name="BashOutput")
+    assert _extract_pending_long_running_timeout_s(msg) == 120.0
+
+
+def test_extract_pending_long_running_timeout_unknown_tool_is_zero():
+    """Tools outside :data:`_LONG_RUNNING_TOOLS` (Read/Write/MCP/…) keep
+    the strict idle guard — they complete promptly enough that no
+    extension is required, and silencing the guard for them would mask
+    real stalls."""
     msg = _bash_assistant(600_000, name="Read")
-    assert _extract_pending_bash_timeout_s(msg) == 0.0
+    assert _extract_pending_long_running_timeout_s(msg) == 0.0
 
 
-def test_extract_pending_bash_timeout_missing_field_is_zero():
+def test_extract_pending_long_running_timeout_missing_field_is_zero():
     msg = _bash_assistant(None)
-    assert _extract_pending_bash_timeout_s(msg) == 0.0
+    assert _extract_pending_long_running_timeout_s(msg) == 0.0
 
 
-def test_extract_pending_bash_timeout_non_assistant_is_zero():
+def test_extract_pending_long_running_timeout_non_assistant_is_zero():
     msg = UserMessage(
         content=[ToolResultBlock(tool_use_id="tu1", content="ok", is_error=False)]
     )
-    assert _extract_pending_bash_timeout_s(msg) == 0.0
+    assert _extract_pending_long_running_timeout_s(msg) == 0.0
 
 
-def test_extract_pending_bash_timeout_takes_max_of_multiple_bash():
+def test_extract_pending_long_running_timeout_takes_max_within_bash():
     msg = AssistantMessage(
         content=[
             ToolUseBlock(id="a", name="Bash", input={"command": "ls", "timeout": 30_000}),
@@ -151,19 +182,56 @@ def test_extract_pending_bash_timeout_takes_max_of_multiple_bash():
         ],
         model="claude-fake",
     )
-    assert _extract_pending_bash_timeout_s(msg) == 600.0
+    assert _extract_pending_long_running_timeout_s(msg) == 600.0
 
 
-def test_extract_pending_bash_timeout_ignores_non_positive_and_non_numeric():
+def test_extract_pending_long_running_timeout_takes_max_across_tool_kinds():
+    """Mix of ``Bash`` + ``TaskOutput`` + ``BashOutput``: the largest
+    timeout across all three tool kinds wins, not the largest within a
+    single kind."""
+    msg = AssistantMessage(
+        content=[
+            ToolUseBlock(
+                id="a", name="Bash", input={"command": "ls", "timeout": 60_000}
+            ),
+            ToolUseBlock(
+                id="b",
+                name="BashOutput",
+                input={"bash_id": "x", "timeout": 120_000},
+            ),
+            ToolUseBlock(
+                id="c",
+                name="TaskOutput",
+                input={"task_id": "t", "block": True, "timeout": 600_000},
+            ),
+        ],
+        model="claude-fake",
+    )
+    assert _extract_pending_long_running_timeout_s(msg) == 600.0
+
+
+def test_extract_pending_long_running_timeout_ignores_non_positive_and_non_numeric():
     msg = AssistantMessage(
         content=[
             ToolUseBlock(id="a", name="Bash", input={"command": "ls", "timeout": -5}),
             ToolUseBlock(id="b", name="Bash", input={"command": "ls", "timeout": "5000"}),
             ToolUseBlock(id="c", name="Bash", input={"command": "ls", "timeout": 0}),
+            ToolUseBlock(
+                id="d", name="TaskOutput", input={"task_id": "t", "timeout": -10}
+            ),
         ],
         model="claude-fake",
     )
-    assert _extract_pending_bash_timeout_s(msg) == 0.0
+    assert _extract_pending_long_running_timeout_s(msg) == 0.0
+
+
+def test_bash_alias_still_resolves():
+    """``_extract_pending_bash_timeout_s`` is kept as a deprecated
+    alias for one release.  Callers who still import the old name must
+    get the new behaviour, including ``TaskOutput`` recognition."""
+    msg = _bash_assistant(600_000, name="TaskOutput")
+    assert _extract_pending_bash_timeout_s(msg) == 600.0
+    assert BASH_IDLE_SLACK_S == LONG_RUNNING_IDLE_SLACK_S
 
 
 class _FakeSDKClient:
@@ -224,8 +292,8 @@ def test_idle_extended_when_bash_timeout_exceeds_budget(monkeypatch):
 
     Without the extension the ``tool_result`` gap (0.4s) would trip
     :class:`asyncio.TimeoutError`; with extension the effective budget is
-    ``max(0.1, 5.0) + BASH_IDLE_SLACK_S = 10.0s`` and the stream
-    completes normally.
+    ``max(0.1, 5.0) + LONG_RUNNING_IDLE_SLACK_S`` (well over the gap) and
+    the stream completes normally.
     """
     assistant = _bash_assistant(5_000)  # 5s Bash timeout
     tool_result = UserMessage(
@@ -251,8 +319,50 @@ def test_idle_extended_when_bash_timeout_exceeds_budget(monkeypatch):
     assert fake.queries == ["hi"]
 
 
-def test_idle_still_fires_without_pending_bash(monkeypatch):
-    """Non-Bash tool_use (or Bash without timeout) keeps the strict idle guard."""
+def test_idle_extended_when_task_output_timeout_exceeds_budget(monkeypatch):
+    """Reproduces the 2026-04-25 ``VALIDATE (quick)`` failure mode.
+
+    The agent issues ``TaskOutput timeout=5000`` (subagent wait) under
+    a 0.1s idle budget, the ``tool_result`` arrives 0.4s later, and
+    the orchestrator must wait it out instead of killing the phase as
+    ``idle_timeout_exhausted``.  Before the 2026-04-25 fix this case
+    would have raised :class:`asyncio.TimeoutError` because the
+    extension helper only matched ``Bash``.
+    """
+    assistant = AssistantMessage(
+        content=[
+            ToolUseBlock(
+                id="tu1",
+                name="TaskOutput",
+                input={"task_id": "t", "block": True, "timeout": 5_000},
+            )
+        ],
+        model="claude-fake",
+    )
+    tool_result = UserMessage(
+        content=[ToolResultBlock(tool_use_id="tu1", content="ok", is_error=False)]
+    )
+    fake = _FakeSDKClient(
+        messages=[assistant, tool_result, _result_message()],
+        delays=[0.01, 0.4, 0.01],
+    )
+    _patch_sdk_client(monkeypatch, fake)
+
+    async def _drive() -> list[object]:
+        async with ClaudeCodeConnector(load_auth=False) as conn:
+            return [msg async for msg in conn.ask("hi", idle_timeout_s=0.1)]
+
+    got = asyncio.run(_drive())
+    assert [type(m).__name__ for m in got] == [
+        "AssistantMessage",
+        "UserMessage",
+        "ResultMessage",
+    ]
+
+
+def test_idle_still_fires_without_pending_long_running_tool(monkeypatch):
+    """Non-long-running tool_use (or one without timeout) keeps the
+    strict idle guard."""
     assistant = AssistantMessage(
         content=[ToolUseBlock(id="r1", name="Read", input={"path": "x"})],
         model="claude-fake",
@@ -274,13 +384,13 @@ def test_idle_still_fires_without_pending_bash(monkeypatch):
         asyncio.run(_drive())
 
 
-def test_idle_resets_when_next_assistant_turn_has_no_bash(monkeypatch):
-    """After a Bash turn, the next assistant turn must reset the budget.
+def test_idle_resets_when_next_assistant_turn_has_no_long_running_tool(monkeypatch):
+    """After a long-running turn, the next assistant turn must reset the budget.
 
     Stream layout:
       1. AssistantMessage(Bash, timeout=5000)      <- enables extension
       2. UserMessage(tool_result)                  <- covered by extension
-      3. AssistantMessage(Read, no Bash)           <- resets pending=0
+      3. AssistantMessage(Read, no long-running)   <- resets pending=0
       4. UserMessage(tool_result_for_read)         <- 0.4s gap, should FAIL
     """
     bash_turn = _bash_assistant(5_000)
@@ -309,16 +419,21 @@ def test_idle_resets_when_next_assistant_turn_has_no_bash(monkeypatch):
         asyncio.run(_drive())
 
 
-def test_bash_slack_constant_is_applied(monkeypatch):
-    """The ``+ BASH_IDLE_SLACK_S`` margin must be honoured.
+def test_long_running_slack_constant_is_applied(monkeypatch):
+    """The ``+ LONG_RUNNING_IDLE_SLACK_S`` margin must be honoured.
 
-    Bash.timeout = 0.1s, idle = 0.05s, real tool_result gap = slack - 0.5s.
-    Without the slack, effective budget would be max(0.05, 0.1) = 0.1s <
-    the gap, and the call would time out.  With slack added the budget
-    is 0.1 + BASH_IDLE_SLACK_S seconds so the gap is comfortably inside.
+    The default 30s slack is sized for production worst-cases (large
+    subagent ``TaskOutput`` payload serialization) and is too long to
+    sleep through in a unit test, so we monkeypatch the slack down to
+    0.4s and arrange a tool_result gap of ``slack - 0.1s``.  Without
+    the slack, ``effective_idle = max(0.05, 0.1) = 0.1s`` would be
+    smaller than the 0.3s gap and the call would time out.  With the
+    slack added the budget is ``0.1 + 0.4s = 0.5s`` so the gap fits
+    inside.
     """
+    monkeypatch.setattr(connector_mod, "LONG_RUNNING_IDLE_SLACK_S", 0.4)
     assistant = _bash_assistant(100)  # 0.1s
-    gap = BASH_IDLE_SLACK_S - 0.5
+    gap = 0.4 - 0.1
     tool_result = UserMessage(
         content=[ToolResultBlock(tool_use_id="tu1", content="ok", is_error=False)]
     )

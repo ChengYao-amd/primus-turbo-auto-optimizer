@@ -69,7 +69,6 @@ async def run(params: CampaignParams) -> PhaseOutcome:
         allowed_tools=ALLOWED_TOOLS + mcp_allowed_tools(),
         mcp_servers={"turbo": server},
         expected_output=expected,
-        max_turns=90,
         round_n=1,
     )
     _sync_representative_shapes(params, outcome.structured)

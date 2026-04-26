@@ -96,7 +96,6 @@ async def run(
         ),
         allowed_tools=ALLOWED_TOOLS,
         expected_output=expected,
-        max_turns=45,
         force=force,
         round_n=round_n,
         phase_variant=trigger,

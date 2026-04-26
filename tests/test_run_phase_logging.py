@@ -269,3 +269,198 @@ def test_run_phase_dry_run_still_logs(tmp_path, monkeypatch, caplog):
     assert outcome.structured == {"dry_run": True, "phase": "UNIT_DRY"}
     messages_text = "\n".join(rec.getMessage() for rec in caplog.records)
     assert "[dry-run] UNIT_DRY" in messages_text
+
+
+# ---------------------------------------------------------------------
+# Wrap-up recovery when the main session forgets to Write the JSON
+# ---------------------------------------------------------------------
+
+
+from turbo_optimize.errors import PhaseExpectedOutputMissing
+
+
+class _SilentConnector(_FakeConnector):
+    """Connector whose ``ask`` yields a clean ResultMessage but writes
+    nothing. Simulates the round-7 OPTIMIZE failure mode where the
+    session closed cleanly (``is_error=True`` or just ran out of
+    turns) without the model ever calling ``Write``.
+    """
+
+
+class _WrapUpWritingConnector(_FakeConnector):
+    """Second-session stand-in that *does* write the expected JSON.
+
+    Used to verify that the orchestrator's wrap-up recovery layer
+    successfully reinvokes Claude with a scoped prompt and recovers
+    from the missing-output state without killing the phase.
+    """
+
+    def __init__(self, messages, target: Path, payload: dict):
+        super().__init__(messages)
+        self._target = target
+        self._payload = payload
+        self.seen_prompts: list[str] = []
+
+    async def ask(self, prompt, *, idle_timeout_s: float | None = None):
+        self.seen_prompts.append(prompt)
+        import json as _json
+
+        self._target.parent.mkdir(parents=True, exist_ok=True)
+        self._target.write_text(_json.dumps(self._payload), encoding="utf-8")
+        async for msg in super().ask(prompt, idle_timeout_s=idle_timeout_s):
+            yield msg
+
+
+def _wrap_up_params(tmp_path: Path) -> tuple[CampaignParams, Path, Path]:
+    workspace = tmp_path / "ws"
+    campaign_dir = tmp_path / "campaign"
+    state_dir = tmp_path / "state"
+    workspace.mkdir()
+    campaign_dir.mkdir()
+    state_dir.mkdir()
+    params = CampaignParams(
+        prompt="unit test",
+        workspace_root=workspace,
+        skills_root=Path("agent_workspace/Primus-Turbo/agent"),
+        state_dir=state_dir,
+    )
+    return params, campaign_dir, state_dir
+
+
+def test_run_phase_wrap_up_recovery_writes_missing_output(
+    tmp_path, monkeypatch, caplog
+):
+    """When the main session closes without writing the JSON, the
+    wrap-up recovery launches a second session whose prompt is the
+    dedicated ``<wrap_up_recovery>`` template, and the payload it
+    writes is returned as the phase outcome. cost.md must record both
+    the silent main attempt and the recovered wrap-up row.
+    """
+    caplog.set_level(logging.INFO, logger="turbo_optimize.orchestrator.run_phase")
+    params, campaign_dir, state_dir = _wrap_up_params(tmp_path)
+
+    expected = state_dir / "phase_result" / "unit_missing.json"
+    recovery_payload = {"recovered": True, "round": 7}
+    silent_messages = [_make_result(cost=1.0, turns=20, duration_ms=2000)]
+    wrap_up_messages = [_make_result(cost=0.05, turns=2, duration_ms=500)]
+
+    wrap_up_connector = _WrapUpWritingConnector(
+        wrap_up_messages, target=expected, payload=recovery_payload
+    )
+
+    call_counter = {"n": 0}
+
+    def _factory(*, options):
+        call_counter["n"] += 1
+        if call_counter["n"] == 1:
+            return _SilentConnector(silent_messages)
+        return wrap_up_connector
+
+    monkeypatch.setattr(run_phase_module, "ClaudeCodeConnector", _factory)
+
+    outcome = asyncio.run(
+        run_phase_module.run_phase(
+            phase="UNIT_MISS",
+            campaign_dir=campaign_dir,
+            params=params,
+            prompt="ORIGINAL_PHASE_PROMPT_BODY",
+            system_prompt="sys",
+            allowed_tools=["Read", "Write"],
+            expected_output=expected,
+            round_n=7,
+        )
+    )
+
+    assert call_counter["n"] == 2, "wrap-up recovery must launch a 2nd session"
+    assert outcome.structured == recovery_payload
+    assert wrap_up_connector.seen_prompts, "wrap-up session received no prompt"
+    wrap_up_prompt = wrap_up_connector.seen_prompts[0]
+    assert "<wrap_up_recovery>" in wrap_up_prompt
+    assert str(expected) in wrap_up_prompt
+    assert "ORIGINAL_PHASE_PROMPT_BODY" in wrap_up_prompt, (
+        "the original prompt must be carried verbatim so the wrap-up "
+        "knows the JSON schema"
+    )
+
+    messages_text = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "expected_output missing" in messages_text
+    assert "launching wrap-up recovery" in messages_text
+    assert "wrap-up attempt 1 produced" in messages_text
+
+    cost_md = (campaign_dir / "logs" / "cost.md").read_text(encoding="utf-8")
+    assert "| UNIT_MISS |" in cost_md
+    assert "| UNIT_MISS (wrap_up) |" in cost_md, (
+        "wrap-up row must be tagged so operators can distinguish it "
+        "from the main attempt"
+    )
+
+
+def test_run_phase_raises_when_wrap_up_also_fails(tmp_path, monkeypatch, caplog):
+    """If every wrap-up attempt also exits without writing the JSON,
+    ``run_phase`` raises :class:`PhaseExpectedOutputMissing` — clearer
+    than the bare ``FileNotFoundError`` the pre-recovery code threw.
+    """
+    caplog.set_level(logging.WARNING, logger="turbo_optimize.orchestrator.run_phase")
+    params, campaign_dir, state_dir = _wrap_up_params(tmp_path)
+
+    expected = state_dir / "phase_result" / "unit_stuck.json"
+
+    silent_messages = [_make_result(cost=0.4, turns=15, duration_ms=1500)]
+
+    def _factory(*, options):
+        return _SilentConnector(silent_messages)
+
+    monkeypatch.setattr(run_phase_module, "ClaudeCodeConnector", _factory)
+
+    with pytest.raises(PhaseExpectedOutputMissing) as exc_info:
+        asyncio.run(
+            run_phase_module.run_phase(
+                phase="UNIT_STUCK",
+                campaign_dir=campaign_dir,
+                params=params,
+                prompt="noop",
+                system_prompt="sys",
+                allowed_tools=["Read", "Write"],
+                expected_output=expected,
+                round_n=9,
+                missing_output_recovery=2,
+            )
+        )
+
+    err = exc_info.value
+    assert err.phase == "UNIT_STUCK"
+    assert err.recovery_attempts == 2
+    assert str(expected) in str(err)
+
+
+def test_run_phase_disables_recovery_when_budget_zero(
+    tmp_path, monkeypatch, caplog
+):
+    """``missing_output_recovery=0`` restores the pre-recovery
+    behaviour so callers / tests that explicitly want a hard failure
+    (e.g. to assert a schema regression) can opt out."""
+    caplog.set_level(logging.WARNING, logger="turbo_optimize.orchestrator.run_phase")
+    params, campaign_dir, state_dir = _wrap_up_params(tmp_path)
+
+    expected = state_dir / "phase_result" / "unit_no_recovery.json"
+
+    def _factory(*, options):
+        return _SilentConnector([_make_result(cost=0.2, turns=5, duration_ms=300)])
+
+    monkeypatch.setattr(run_phase_module, "ClaudeCodeConnector", _factory)
+
+    with pytest.raises(PhaseExpectedOutputMissing) as exc_info:
+        asyncio.run(
+            run_phase_module.run_phase(
+                phase="UNIT_NORECOV",
+                campaign_dir=campaign_dir,
+                params=params,
+                prompt="noop",
+                system_prompt="sys",
+                allowed_tools=["Read", "Write"],
+                expected_output=expected,
+                missing_output_recovery=0,
+            )
+        )
+
+    assert exc_info.value.recovery_attempts == 0

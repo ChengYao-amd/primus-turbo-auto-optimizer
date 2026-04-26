@@ -217,7 +217,6 @@ async def run(
         allowed_tools=ALLOWED_TOOLS + mcp_allowed_tools(),
         mcp_servers={"turbo": server},
         expected_output=expected,
-        max_turns=70,
         force=force,
         round_n=round_n,
         phase_variant=validation_level,

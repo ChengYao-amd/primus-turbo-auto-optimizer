@@ -45,7 +45,11 @@ from claude_agent_sdk import (
 )
 
 from turbo_optimize.config import CampaignParams, get_phase_timeouts
-from turbo_optimize.errors import PhaseIdleTimeout, PhaseWallTimeout
+from turbo_optimize.errors import (
+    PhaseExpectedOutputMissing,
+    PhaseIdleTimeout,
+    PhaseWallTimeout,
+)
 from turbo_optimize.logs import append_cost_row
 from turbo_optimize.model_connnector.claude_code_connector import ClaudeCodeConnector
 from turbo_optimize.signals import GracefulStop, stop_requested
@@ -62,6 +66,30 @@ Level-2 lives inside
 :py:meth:`turbo_optimize.model_connnector.claude_code_connector.ClaudeCodeConnector.__aexit__`
 where ``disconnect`` is wrapped in ``asyncio.wait_for``.
 """
+
+
+# ---------------------------------------------------------------------
+# Wrap-up recovery constants
+# ---------------------------------------------------------------------
+#
+# See the "Wrap-up recovery for the 'session ended without Write'
+# failure mode" block further down for the mechanism description;
+# the constants live up here so :func:`run_phase`'s default kwargs
+# can reference them at function-definition time.
+
+WRAP_UP_WALL_TIMEOUT_S: float = 600.0
+"""Hard wall budget for a single wrap-up recovery attempt.
+
+Wrap-up sessions should only Read + Write. 10 minutes is generous;
+anything longer almost certainly means the model is redoing work it
+was explicitly told to skip, so cutting the session short avoids
+burning the operator's budget on a diverging retry."""
+
+DEFAULT_MISSING_OUTPUT_RECOVERY: int = 1
+"""How many wrap-up attempts to make before raising
+:class:`PhaseExpectedOutputMissing`. One is almost always enough; the
+second would only help if the first wrap-up itself hit wall timeout
+or idle timeout, which is rare in practice."""
 
 
 @dataclass
@@ -107,6 +135,14 @@ class _AttemptOutcome:
     ``last_event_kind`` is threaded back out so that when the outer
     wall timeout fires mid-attempt we can still emit a useful
     ``last_event_kind`` field in the transcript event.
+
+    ``sdk_is_error`` reflects the ``is_error`` flag on the last
+    :class:`ResultMessage`. The SDK sets it to ``True`` when the CLI
+    decides the session ended abnormally (``max_turns`` exhausted,
+    budget hit, …). We record it purely for diagnostics; the
+    missing-output recovery below triggers on the absence of the
+    ``expected_output`` file alone so "model quietly stopped without
+    an error flag" is also caught.
     """
 
     cost_usd: float = 0.0
@@ -114,6 +150,7 @@ class _AttemptOutcome:
     sdk_duration_ms: int | None = None
     stopped: bool = False
     last_event_kind: str | None = None
+    sdk_is_error: bool = False
 
 
 async def run_phase(
@@ -137,6 +174,7 @@ async def run_phase(
     wall_timeout_s: float | None = None,
     max_retries: int | None = None,
     retriable: bool | None = None,
+    missing_output_recovery: int = DEFAULT_MISSING_OUTPUT_RECOVERY,
 ) -> PhaseOutcome:
     """Run one phase, possibly reusing a cached structured result.
 
@@ -156,6 +194,25 @@ async def run_phase(
     resolved from
     :data:`turbo_optimize.config.PHASE_TIMEOUT_DEFAULTS` keyed by ``phase``.
     Callers that need to opt out can pass ``idle_timeout_s=0``.
+
+    ``max_turns`` is deliberately left at ``None`` for every phase in
+    ``turbo_optimize.orchestrator.phases.*`` — the kwarg stays on the
+    plumbing so tests / future callers can still pin a cap, but the
+    default ``None`` path avoids sending ``--max-turns`` to the CLI and
+    inherits the CLI's ``unlimited`` default. Cost containment is the
+    job of ``wall_timeout_s`` (PHASE_TIMEOUT_DEFAULTS) instead of a
+    turn counter; a low turn counter was the root cause of the
+    round-7 OPTIMIZE failure where 51 turns exhausted the cap before
+    the agent could emit its ``Write`` for the result JSON.
+
+    ``missing_output_recovery`` controls how many wrap-up sessions the
+    phase will launch if the main attempt loop finishes but the
+    ``expected_output`` JSON is still missing. Each wrap-up session
+    has its own wall budget (:data:`WRAP_UP_WALL_TIMEOUT_S`) and
+    prompts Claude to read the current workspace state and emit the
+    JSON without redoing any work. Setting this to ``0`` restores the
+    pre-recovery behaviour (raise :class:`PhaseExpectedOutputMissing`
+    immediately); tests use ``0`` to keep fixtures small.
     """
     defaults = get_phase_timeouts(phase, phase_variant)
     if idle_timeout_s is None:
@@ -241,7 +298,11 @@ async def run_phase(
                 exc,
             )
 
-    return await _execute_phase(invocation, messages_log)
+    return await _execute_phase(
+        invocation,
+        messages_log,
+        missing_output_recovery=missing_output_recovery,
+    )
 
 
 def _record_cost(
@@ -302,9 +363,230 @@ def _build_options(invocation: PhaseInvocation) -> ClaudeAgentOptions:
     return ClaudeAgentOptions(**option_kwargs)
 
 
+# ---------------------------------------------------------------------
+# Wrap-up recovery for the "session ended without Write" failure mode
+# ---------------------------------------------------------------------
+#
+# Observed in round-7 OPTIMIZE (2026-04-23): the Claude session closed
+# cleanly after 51 turns (``max_turns`` at the time), the kernel edits
+# and rebuild were on disk, but the required structured JSON at
+# ``state/.../phase_result/optimize_round7.json`` was never written.
+# The old code path raised ``FileNotFoundError`` and killed the
+# campaign, wasting the $6 of work already done.
+#
+# The recovery layer below runs a second, scoped Claude session that
+# reuses the original allowed_tools + MCP servers but replaces the
+# prompt with a narrow "stop, inspect the current tree, emit the JSON,
+# exit" instruction. The wrap-up has its own wall budget
+# (``WRAP_UP_WALL_TIMEOUT_S``) so even a pathological wrap-up cannot
+# stretch the phase indefinitely. ``max_retries`` / ``retriable`` stay
+# off because wrap-up should converge in a handful of turns; if it
+# does not, something more fundamental is broken and the orchestrator
+# is better off raising PhaseExpectedOutputMissing than repeatedly
+# retrying.
+
+# Wrap-up recovery constants are declared at module scope further
+# above (near the imports) so :func:`run_phase`'s default argument
+# ``missing_output_recovery=DEFAULT_MISSING_OUTPUT_RECOVERY`` can
+# resolve at function-definition time.
+
+
+def _build_wrap_up_prompt(invocation: PhaseInvocation) -> str:
+    """Render the wrap-up prompt for a recovery attempt.
+
+    The template pins the model to a single responsibility — inspect
+    current on-disk state, emit the missing JSON, exit — and carries
+    the original prompt verbatim so the schema is available without
+    round-tripping through the phase runner again.
+    """
+    path = invocation.expected_output
+    round_label = (
+        f"round-{invocation.round_n}" if invocation.round_n is not None else "-"
+    )
+    return (
+        "<wrap_up_recovery>\n"
+        f"Your previous session for phase **{invocation.phase}** "
+        f"({round_label}) ended without writing the required "
+        f"structured result to:\n\n"
+        f"  {path}\n\n"
+        "The orchestrator detected the missing file after the session "
+        "closed. Any code edits, kernel rebuilds, benchmark runs, or "
+        "MCP mutations you performed in that session are ALREADY on "
+        "disk — do NOT redo them.\n\n"
+        "Your ONLY remaining job:\n\n"
+        "1. If you need to recall what the previous session produced, "
+        "use `Read`, `Glob`, or `Grep` against the workspace and the "
+        "phase artefacts. Do NOT run benchmarks, tests, or builds.\n"
+        f"2. Emit exactly one JSON document at `{path}` that matches "
+        "the schema described in the original phase prompt below.\n"
+        "3. After the `Write`, exit immediately: no chat, no extra "
+        "tool calls.\n\n"
+        "If the schema requires fields you never actually collected "
+        "(e.g. benchmark numbers you did not run), fill them with "
+        "`null` / empty arrays / sentinel strings and add a free-form "
+        "`\"notes\"` field flagging the incompleteness. The orchestrator "
+        "will treat the round as a rollback rather than crash.\n\n"
+        "--- ORIGINAL PHASE PROMPT (for schema reference only; do NOT "
+        "redo the work it describes) ---\n\n"
+        f"{invocation.prompt}\n"
+        "</wrap_up_recovery>\n"
+    )
+
+
+def _build_wrap_up_invocation(invocation: PhaseInvocation) -> PhaseInvocation:
+    """Clone the original invocation for a wrap-up attempt.
+
+    We keep allowed_tools / MCP servers / agents identical so the
+    wrap-up has access to every write path the original prompt
+    referenced (REPORT's ``mcp__turbo__append_tip``, ANALYZE's MCP
+    history queries, …). Timeouts shrink to the wrap-up budget and
+    ``phase_variant`` is tagged so the resulting ``logs/cost.md`` row
+    is unambiguous.
+    """
+    variant = (
+        f"{invocation.phase_variant}_wrap_up"
+        if invocation.phase_variant
+        else "wrap_up"
+    )
+    return PhaseInvocation(
+        phase=invocation.phase,
+        prompt=_build_wrap_up_prompt(invocation),
+        allowed_tools=list(invocation.allowed_tools),
+        system_prompt=invocation.system_prompt,
+        mcp_servers=dict(invocation.mcp_servers),
+        agents=dict(invocation.agents) if invocation.agents else None,
+        extra_tools=list(invocation.extra_tools),
+        expected_output=invocation.expected_output,
+        max_turns=None,
+        cwd=invocation.cwd,
+        setting_sources=list(invocation.setting_sources),
+        model=invocation.model,
+        effort=invocation.effort,
+        round_n=invocation.round_n,
+        phase_variant=variant,
+        campaign_dir=invocation.campaign_dir,
+        idle_timeout_s=invocation.idle_timeout_s,
+        wall_timeout_s=WRAP_UP_WALL_TIMEOUT_S,
+        max_retries=0,
+        retriable=False,
+    )
+
+
+async def _run_wrap_up_attempt(
+    invocation: PhaseInvocation,
+    transcript_path: Path,
+    *,
+    attempt_idx: int,
+) -> _AttemptOutcome:
+    """Execute one wrap-up session end-to-end.
+
+    Uses :func:`_run_single_attempt` for the actual SDK round-trip and
+    wraps it in ``asyncio.wait_for`` so the wrap-up can never run
+    longer than its own wall budget even if idle timeouts fail to
+    fire. The cost row is appended to ``logs/cost.md`` so operators
+    see the wrap-up spend separately from the main attempt.
+    """
+    wrap_up = _build_wrap_up_invocation(invocation)
+    totals = _AttemptOutcome()
+    start = time.perf_counter()
+    status = "ok"
+    error: BaseException | None = None
+
+    _record_transcript_event(
+        transcript_path,
+        kind="wrap_up_begin",
+        phase=wrap_up.phase,
+        attempt=attempt_idx,
+        expected_output=str(wrap_up.expected_output),
+        wall_timeout_s=wrap_up.wall_timeout_s,
+    )
+
+    try:
+        coro = _run_single_attempt(
+            wrap_up,
+            transcript_path,
+            attempt=attempt_idx,
+            totals=totals,
+        )
+        if wrap_up.wall_timeout_s is not None:
+            await asyncio.wait_for(coro, timeout=wrap_up.wall_timeout_s)
+        else:
+            await coro
+    except asyncio.TimeoutError as exc:
+        status = "wrap_up_wall_timeout"
+        error = PhaseWallTimeout(
+            phase=wrap_up.phase, elapsed_s=time.perf_counter() - start
+        )
+        _record_transcript_event(
+            transcript_path,
+            kind="wrap_up_wall_timeout",
+            phase=wrap_up.phase,
+            attempt=attempt_idx,
+            wall_timeout_s=wrap_up.wall_timeout_s,
+        )
+        log.warning(
+            "[%s] wrap-up attempt %d hit wall timeout after %.1fs",
+            wrap_up.phase,
+            attempt_idx,
+            wrap_up.wall_timeout_s,
+        )
+    except PhaseIdleTimeout as exc:
+        status = "wrap_up_idle_timeout"
+        error = exc
+        log.warning(
+            "[%s] wrap-up attempt %d idle timeout: %s",
+            wrap_up.phase,
+            attempt_idx,
+            exc,
+        )
+    except Exception as exc:  # noqa: BLE001
+        status = f"wrap_up_error:{type(exc).__name__}"
+        error = exc
+        log.exception(
+            "[%s] wrap-up attempt %d raised %s",
+            wrap_up.phase,
+            attempt_idx,
+            type(exc).__name__,
+        )
+    finally:
+        wall_dt = time.perf_counter() - start
+        sdk_s = (
+            None
+            if totals.sdk_duration_ms is None
+            else totals.sdk_duration_ms / 1000.0
+        )
+        _record_transcript_event(
+            transcript_path,
+            kind="wrap_up_end",
+            phase=wrap_up.phase,
+            attempt=attempt_idx,
+            status=status,
+            wall_s=round(wall_dt, 3),
+            turns=totals.turns,
+            cost_usd=round(totals.cost_usd, 6),
+        )
+        _record_cost(
+            wrap_up,
+            status=status,
+            wall_s=wall_dt,
+            sdk_s=sdk_s,
+            turns=totals.turns,
+            cost_usd=totals.cost_usd,
+        )
+
+    if error is not None:
+        # We deliberately don't raise: wrap-up failures fall back to
+        # the caller's "still missing?" check, which then decides
+        # whether to retry or raise PhaseExpectedOutputMissing.
+        totals.stopped = False
+    return totals
+
+
 async def _execute_phase(
     invocation: PhaseInvocation,
     transcript_path: Path,
+    *,
+    missing_output_recovery: int = DEFAULT_MISSING_OUTPUT_RECOVERY,
 ) -> PhaseOutcome:
     """Run one phase end-to-end with idle- and wall-timeout guards.
 
@@ -436,7 +718,49 @@ async def _execute_phase(
 
     structured: dict[str, Any] | None = None
     if invocation.expected_output is not None:
-        structured = _load_expected_output(invocation.expected_output)
+        expected = invocation.expected_output
+        if not expected.exists():
+            # The main attempt loop closed cleanly but the model never
+            # emitted the required Write. Run bounded wrap-up recovery
+            # sessions; each one re-invokes Claude with a tight prompt
+            # that only Reads + Writes. If every attempt still fails,
+            # raise PhaseExpectedOutputMissing so the caller can
+            # decide whether to mark the round as a rollback or abort
+            # the whole campaign.
+            attempts_used = 0
+            sdk_is_error = totals.sdk_is_error
+            log.warning(
+                "[%s] expected_output missing at %s after clean session "
+                "(sdk is_error=%s, turns=%d); launching wrap-up recovery "
+                "(budget=%d attempt(s))",
+                invocation.phase,
+                expected,
+                sdk_is_error,
+                totals.turns,
+                missing_output_recovery,
+            )
+            for idx in range(missing_output_recovery):
+                attempts_used = idx + 1
+                await _run_wrap_up_attempt(
+                    invocation,
+                    transcript_path,
+                    attempt_idx=attempts_used,
+                )
+                if expected.exists():
+                    log.info(
+                        "[%s] wrap-up attempt %d produced %s; resuming",
+                        invocation.phase,
+                        attempts_used,
+                        expected,
+                    )
+                    break
+            if not expected.exists():
+                raise PhaseExpectedOutputMissing(
+                    phase=invocation.phase,
+                    expected_output=expected,
+                    recovery_attempts=attempts_used,
+                )
+        structured = _load_expected_output(expected)
     return PhaseOutcome(
         phase=invocation.phase,
         messages_log=transcript_path,
@@ -581,6 +905,10 @@ async def _run_single_attempt(
                             if dur is not None:
                                 outcome.sdk_duration_ms = int(dur)
                                 totals.sdk_duration_ms = int(dur)
+                            is_err = bool(getattr(msg, "is_error", False))
+                            if is_err:
+                                outcome.sdk_is_error = True
+                                totals.sdk_is_error = True
                         if stop_requested():
                             outcome.stopped = True
                             log.warning(

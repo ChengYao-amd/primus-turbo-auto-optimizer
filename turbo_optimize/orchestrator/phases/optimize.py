@@ -104,7 +104,6 @@ async def run(
         ),
         allowed_tools=ALLOWED_TOOLS,
         expected_output=expected,
-        max_turns=50,
         force=bool(retry_context),
         round_n=round_n,
     )
