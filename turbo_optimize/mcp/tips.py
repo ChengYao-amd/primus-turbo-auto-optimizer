@@ -1,16 +1,28 @@
-"""Long-lived historical experience tips (`agent/historical_experience/.../tips.md`).
+"""Long-lived historical experience tips knowledge base.
 
-The path convention is:
-    agent/historical_experience/<target_gpu>/<target_op>/<target_backend_lower>/tips.md
+The on-disk layout is a three-level fanout under the configured tips
+root::
 
-Appends use a simple lock file so multiple campaigns running in parallel
-on the same host do not interleave partial writes.
+    <tips_root>/<target_gpu>/<target_op>/<target_backend_lower>/tips.md
+
+``<tips_root>`` is :attr:`turbo_optimize.config.CampaignParams.tips_root`,
+which defaults to ``<tool_repo>/agent_data/historical_experience``
+(see :func:`turbo_optimize.config.default_tips_root`). The default is
+deliberately OUTSIDE the optimized project's ``workspace_root``: rollback
+runs ``git clean -fd`` there and would otherwise erase the tips along
+with every other untracked file. Keeping the knowledge base in the
+orchestrator repo (or in a path supplied by ``TURBO_TIPS_ROOT``) makes
+the file survive every rollback, and lets the user commit the tips back
+to the orchestrator repo when they want them shared across machines.
+
+Appends are guarded by an :func:`fcntl.flock` lock file so multiple
+campaigns running in parallel on the same host do not interleave
+partial writes.
 """
 
 from __future__ import annotations
 
 import fcntl
-import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -21,18 +33,15 @@ if TYPE_CHECKING:
     from turbo_optimize.mcp import CampaignContext
 
 
-TIPS_ROOT_REL = Path("agent") / "historical_experience"
+def _tips_path(tips_root: Path, gpu: str, op: str, backend: str) -> Path:
+    """Return the absolute ``tips.md`` path for ``(gpu, op, backend)``.
 
-
-def _tips_path(workspace_root: Path, gpu: str, op: str, backend: str) -> Path:
-    return (
-        workspace_root
-        / TIPS_ROOT_REL
-        / gpu
-        / op
-        / backend.lower()
-        / "tips.md"
-    )
+    ``tips_root`` is taken verbatim — callers (the MCP server and the
+    READ_HISTORICAL_TIPS / REPORT phase runners) are responsible for
+    resolving :attr:`CampaignParams.tips_root` to an absolute path
+    before invoking this helper.
+    """
+    return tips_root / gpu / op / backend.lower() / "tips.md"
 
 
 def query_tips_impl(
@@ -47,7 +56,7 @@ def query_tips_impl(
             "items": [],
             "note": "op/backend/gpu missing; campaign context did not supply them",
         }
-    path = _tips_path(ctx.workspace_root, gpu, op, backend)
+    path = _tips_path(ctx.tips_root, gpu, op, backend)
     if not path.exists():
         return {
             "path": str(path),
@@ -75,7 +84,7 @@ def append_tip_impl(
 ) -> dict[str, Any]:
     if not op or not backend or not gpu:
         raise ValueError("op / backend / gpu must all be provided (or in params)")
-    path = _tips_path(ctx.workspace_root, gpu, op, backend)
+    path = _tips_path(ctx.tips_root, gpu, op, backend)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         path.write_text(

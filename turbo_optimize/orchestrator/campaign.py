@@ -85,6 +85,7 @@ from turbo_optimize.state import (
     RunState,
     advance_phase,
     load_or_init_run,
+    phase_result_path,
     record_round_event,
     save_run_state,
 )
@@ -1849,10 +1850,87 @@ def _append_termination_block(
     append_termination_block(campaign_dir, checks=checks, passed=passed)
 
 
+def _invalidate_stale_report_cache(state_dir: Path, state: RunState) -> None:
+    """Drop the cached REPORT ``phase_result/report.json`` when the
+    on-disk summary no longer matches the current campaign state.
+
+    Why this exists. ``run_phase`` reuses ``phase_result/<phase>.json``
+    whenever the file is loadable, which means a warm-restart that
+    hits REPORT again will normally skip the LLM session entirely
+    (``cost.md`` row labelled ``cached``). For most phases that is the
+    right choice — the phase output is purely a function of the prompt
+    inputs. REPORT is the exception: its only side effect besides
+    writing ``report.json`` is appending entries to the cross-campaign
+    ``tips.md`` knowledge base via ``mcp__turbo__append_tip``. If the
+    cache wins, **no new tips are written** even when the resumed
+    campaign produced more ACCEPT / ROLLBACK rounds with fresh
+    lessons. The
+    ``optimize_grouped_gemm_fp8_tensorwise_triton_back_202604231519``
+    incident lost the R56 / R57 / R69 / R77 success tips this way: the
+    second REPORT (after warm restart) ran in ``cached`` mode and
+    distilled nothing.
+
+    Staleness rule. We force a rerun when either of:
+
+    * ``final_best_aggregate.round`` in the cached report disagrees
+      with :attr:`RunState.best_round` — a different best round was
+      accepted on the resumed run, so the headline numbers and the
+      "Key Effective Optimizations" tip pool both moved.
+    * ``total_rounds`` in the cached report disagrees with
+      :attr:`RunState.current_round` — more rounds happened (even if
+      the best stayed the same), and any new ROLLBACKs may carry
+      reusable failure tips that the previous REPORT could not see.
+
+    Cache misses (file absent) and corrupt / old-schema files (JSON
+    load error) are no-ops — ``run_phase`` already handles those by
+    re-running the phase, so this helper only acts on the genuinely
+    stale case.
+    """
+    report_path = phase_result_path(state_dir, "REPORT")
+    if not report_path.exists():
+        return
+    try:
+        prev = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        log.warning(
+            "REPORT cache check: cannot parse %s (%s); leaving as-is "
+            "(run_phase will re-run on its own when the cache is "
+            "unloadable)",
+            report_path,
+            exc,
+        )
+        return
+    cached_best = (prev.get("final_best_aggregate") or {}).get("round")
+    cached_total = prev.get("total_rounds")
+    if cached_best == state.best_round and cached_total == state.current_round:
+        return
+    log.info(
+        "REPORT cache stale (cached best_round=%s total_rounds=%s vs "
+        "state best_round=%s current_round=%s); unlinking %s so the "
+        "phase re-runs and new ACCEPT / ROLLBACK rounds get distilled "
+        "into tips.md",
+        cached_best,
+        cached_total,
+        state.best_round,
+        state.current_round,
+        report_path,
+    )
+    try:
+        report_path.unlink()
+    except OSError as exc:
+        log.warning(
+            "REPORT cache invalidation: cannot unlink %s (%s); falling "
+            "back to cached output, new tips may be lost this round",
+            report_path,
+            exc,
+        )
+
+
 async def _final_report(params: CampaignParams, state: RunState, *, reason: str) -> None:
     if params.campaign_dir is None:
         log.warning("no campaign_dir; skipping REPORT")
         return
+    _invalidate_stale_report_cache(params.state_dir, state)
     termination = {
         "reason": reason,
         "best_round": state.best_round,

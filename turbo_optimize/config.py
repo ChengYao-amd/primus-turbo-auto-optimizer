@@ -8,6 +8,7 @@ merges the manifest-confirmed fields once the user approves the draft.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -168,6 +169,19 @@ class CampaignParams:
     dry_run: bool = False
     state_dir: Path = Path("state")
 
+    # Historical-tips knowledge base root. ``None`` resolves at access
+    # time via :func:`default_tips_root` so the chosen location follows
+    # the current tool checkout / ``TURBO_TIPS_ROOT`` env override even
+    # when an old ``run.json`` (which never wrote this key) is resumed.
+    # The path is intentionally OUTSIDE ``workspace_root``: keeping tips
+    # under the optimized project meant
+    # ``_git_rollback`` -> ``git clean -fd`` would erase ``tips.md``
+    # along with every untracked file the failed round dropped, which is
+    # exactly how the
+    # ``optimize_grouped_gemm_fp8_tensorwise_triton_back_202604231519``
+    # run lost all 5 tips written at R50 REPORT.
+    tips_root: Path | None = None
+
     manifest_fields: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -185,10 +199,22 @@ class CampaignParams:
             "skills_root",
             "state_dir",
             "campaign_dir",
+            "tips_root",
         ):
             if key in kwargs and kwargs[key] is not None:
                 kwargs[key] = Path(kwargs[key])
         return cls(**kwargs)
+
+    def resolved_tips_root(self) -> Path:
+        """Return the effective historical-tips root (always absolute).
+
+        Resolves :attr:`tips_root` against :func:`default_tips_root` when
+        the field is unset, so callers never have to special-case
+        ``None``. Result is ``Path``-resolved (symlinks collapsed) to
+        avoid cross-mount comparison surprises.
+        """
+        root = self.tips_root if self.tips_root is not None else default_tips_root()
+        return Path(root).expanduser().resolve()
 
     def resolve_runtime_defaults(self) -> None:
         """Fill ``model`` / ``effort`` with the hardcoded fallbacks if unset.
@@ -317,3 +343,32 @@ def validate_campaign_id(cid: str) -> str:
 
 def default_campaign_root(workspace_root: Path) -> Path:
     return workspace_root / "agent" / "workspace"
+
+
+def default_tips_root() -> Path:
+    """Return the default historical-tips root path.
+
+    Resolution order (first match wins):
+
+    1. ``TURBO_TIPS_ROOT`` environment variable. Useful when several
+       worktrees / virtualenvs of this repo should share one knowledge
+       base, or when tips live on a network volume.
+    2. ``<tool_repo>/agent_data/historical_experience``, where
+       ``<tool_repo>`` is the parent of the ``turbo_optimize`` package
+       (i.e. ``primus-turbo-auto-optimizer/`` for this checkout).
+
+    The default location is intentionally inside the orchestrator
+    repo rather than under ``workspace_root``: the ``_git_rollback``
+    step run after every failed round executes ``git clean -fd``
+    inside ``workspace_root``, which deletes any untracked file or
+    directory there — including the tips knowledge base. Keeping
+    ``tips.md`` outside of that tree makes the file survive every
+    rollback regardless of how the optimized project's ``.gitignore``
+    is configured.
+    """
+    env = os.environ.get("TURBO_TIPS_ROOT")
+    if env:
+        return Path(env).expanduser().resolve()
+    pkg_dir = Path(__file__).resolve().parent
+    tool_repo = pkg_dir.parent
+    return tool_repo / "agent_data" / "historical_experience"

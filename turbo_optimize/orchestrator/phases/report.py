@@ -2,8 +2,16 @@
 
 Besides the final-report write-up, this phase is the single point in the
 campaign where historical tips get distilled and appended to the
-workspace-level knowledge base at
-``<workspace_root>/agent/historical_experience/<gpu>/<op>/<backend>/tips.md``.
+cross-campaign knowledge base at
+``<tips_root>/<gpu>/<op>/<backend>/tips.md``. ``tips_root`` defaults to
+``<tool_repo>/agent_data/historical_experience`` and is configurable via
+the ``TURBO_TIPS_ROOT`` environment variable; see
+:func:`turbo_optimize.config.default_tips_root` and
+:meth:`turbo_optimize.config.CampaignParams.resolved_tips_root`. The
+default location is intentionally outside the optimized project's
+``workspace_root`` so the rollback step (``git clean -fd`` inside
+``workspace_root``) cannot erase the tips knowledge base together with
+the other untracked files dropped by a failed round.
 
 Centralising tip writes here (rather than in VALIDATE per-round) lets
 Claude compare the full accepted/rolled-back set before choosing which

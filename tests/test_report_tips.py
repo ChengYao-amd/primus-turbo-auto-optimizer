@@ -1,8 +1,11 @@
 """Tests for REPORT-phase tip distillation wiring.
 
 The intent captured here:
-* REPORT is the single write-point for the cross-campaign
-  ``agent/historical_experience/.../tips.md`` knowledge base.
+* REPORT is the single write-point for the cross-campaign tips knowledge
+  base at ``<tips_root>/<gpu>/<op>/<backend>/tips.md`` (``tips_root``
+  defaults to ``<tool_repo>/agent_data/historical_experience`` and is
+  configurable via ``TURBO_TIPS_ROOT``; see
+  :func:`turbo_optimize.config.default_tips_root`).
 * The phase must expose ``mcp__turbo__*`` tools (for ``append_tip`` +
   history queries) AND the prompt must explicitly instruct Claude to
   use ``append_tip`` with the required quality bar.

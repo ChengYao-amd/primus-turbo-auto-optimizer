@@ -22,18 +22,22 @@ ALLOWED_TOOLS = [
 
 
 def tips_path(params: CampaignParams) -> Path:
+    """Compute the absolute ``tips.md`` path for the campaign.
+
+    Reuses :func:`turbo_optimize.mcp.tips._tips_path` so the prompt-side
+    string and the MCP-side write/read paths can never drift. The root
+    is resolved via :meth:`CampaignParams.resolved_tips_root`, which
+    honours the ``TURBO_TIPS_ROOT`` environment variable and falls back
+    to ``<tool_repo>/agent_data/historical_experience`` (see
+    :func:`turbo_optimize.config.default_tips_root` for why this lives
+    outside the optimized project's working tree).
+    """
+    from turbo_optimize.mcp.tips import _tips_path
+
     op = params.target_op or ""
-    backend = (params.target_backend or "").lower()
+    backend = params.target_backend or ""
     gpu = params.target_gpu or ""
-    return (
-        params.workspace_root
-        / "agent"
-        / "historical_experience"
-        / gpu
-        / op
-        / backend
-        / "tips.md"
-    )
+    return _tips_path(params.resolved_tips_root(), gpu, op, backend)
 
 
 async def run(params: CampaignParams) -> PhaseOutcome:

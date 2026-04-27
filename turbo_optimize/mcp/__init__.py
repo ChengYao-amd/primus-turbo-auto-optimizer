@@ -48,6 +48,7 @@ class CampaignContext:
     campaign_dir: Path
     workspace_root: Path
     skills_root: Path
+    tips_root: Path
     target_op: str | None
     target_backend: str | None
     target_gpu: str | None
@@ -62,6 +63,7 @@ def _context_from_params(params: CampaignParams) -> CampaignContext:
         campaign_dir=params.campaign_dir,
         workspace_root=params.workspace_root,
         skills_root=params.skills_root,
+        tips_root=params.resolved_tips_root(),
         target_op=params.target_op,
         target_backend=params.target_backend,
         target_gpu=params.target_gpu,
@@ -104,9 +106,12 @@ def build_in_process_server(params: CampaignParams):
 
     @tool(
         "query_tips",
-        "Search agent/historical_experience/<gpu>/<op>/<backend>/tips.md for "
-        "reusable lessons. Optional keyword filters entries by substring match. "
-        "Any of op/backend/gpu left empty falls back to the current campaign's values.",
+        "Search the cross-campaign historical-experience tips file at "
+        "<tips_root>/<gpu>/<op>/<backend>/tips.md for reusable lessons. "
+        "tips_root defaults to <tool_repo>/agent_data/historical_experience "
+        "(see TURBO_TIPS_ROOT env override). Optional keyword filters entries "
+        "by substring match. Any of op/backend/gpu left empty falls back to "
+        "the current campaign's values.",
         {"op": str, "backend": str, "gpu": str, "keyword": str},
     )
     async def _query_tips(args: dict) -> dict:
@@ -121,10 +126,11 @@ def build_in_process_server(params: CampaignParams):
 
     @tool(
         "append_tip",
-        "Append a reusable tip to agent/historical_experience/<gpu>/<op>/"
-        "<backend>/tips.md. Fields: op/backend/gpu (default to campaign's), "
-        "round (required), status (ACCEPTED|ROLLED_BACK), context, signal, "
-        "takeaway, applicability.",
+        "Append a reusable tip to <tips_root>/<gpu>/<op>/<backend>/tips.md "
+        "(tips_root defaults to <tool_repo>/agent_data/historical_experience; "
+        "set TURBO_TIPS_ROOT to override). Fields: op/backend/gpu (default to "
+        "campaign's), round (required), status (ACCEPTED|ROLLED_BACK), "
+        "context, signal, takeaway, applicability.",
         {
             "op": str,
             "backend": str,
