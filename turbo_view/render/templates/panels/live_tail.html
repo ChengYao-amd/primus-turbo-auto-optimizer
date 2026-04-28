@@ -1,0 +1,16 @@
+<section id="live-tail" class="panel" data-watch-only="1" hidden>
+  <h2>live transcript</h2>
+  <div class="live-tail-controls">
+    <label>phase
+      <select data-role="tail-phase">
+        <option value="">(loading…)</option>
+      </select>
+    </label>
+    <label>tail
+      <input type="number" min="10" max="500" step="10" value="50" data-role="tail-n">
+    </label>
+    <button type="button" data-role="tail-refresh">refresh</button>
+    <span class="live-tail-status" data-role="tail-status"></span>
+  </div>
+  <pre class="live-tail-body" data-role="tail-body"></pre>
+</section>

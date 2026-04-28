@@ -1,0 +1,11 @@
+Kernel_Name,Start_Timestamp,End_Timestamp,VGPR_Count,Accum_VGPR_Count,SGPR_Count,LDS_Block_Size_Bytes,Scratch_Size,Workgroup_Size_X,Grid_Size_X
+_grouped_fp8_persistent_gemm_kernel,1000,4100000,256,256,96,16384,0,256,128
+_grouped_fp8_persistent_gemm_kernel,5000000,8100000,256,256,96,16384,0,256,128
+_grouped_variable_k_gemm_kernel,9000000,11100000,224,224,80,8192,0,256,64
+"void primus_turbo::unary_kernel<bf16, fp8>",12000000,12800000,128,128,48,0,0,256,32
+"void primus_turbo::reduce_row_kernel<float, AbsMax>",13000000,13450000,160,160,64,4096,0,256,32
+"void at::native::vectorized_elementwise_kernel<float>",14000000,14320000,96,96,32,0,0,256,8
+"void at::native::indexSelectLargeIndex<float>",15000000,15280000,64,64,24,0,0,256,8
+_grouped_fp8_persistent_gemm_kernel,16000000,17800000,256,256,96,16384,0,256,128
+_grouped_variable_k_gemm_kernel,18000000,19200000,224,224,80,8192,0,256,64
+"void primus_turbo::unary_kernel<bf16, fp8>",20000000,20650000,128,128,48,0,0,256,32

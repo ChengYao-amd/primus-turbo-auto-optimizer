@@ -1,0 +1,36 @@
+{% extends "layout.html" %}
+{% block body %}
+<header class="page-header">
+  <h1>primus-turbo-view · overview</h1>
+  <p class="meta">
+    {{ campaign_count }} campaign{% if campaign_count != 1 %}s{% endif %} ·
+    rendered at {{ rendered_at }} · schema {{ schema_version }}
+  </p>
+</header>
+<main>
+  <section id="kpi" class="panel kpi-bar"></section>
+  <section id="filters" class="panel filters-bar"></section>
+  <section id="campaigns" class="panel">
+    <div class="table-wrap">
+      <table data-role="overview-table">
+        <thead>
+          <tr>
+            <th>campaign</th>
+            <th>op</th>
+            <th>backend</th>
+            <th>gpu</th>
+            <th>status</th>
+            <th>round / best</th>
+            <th>best Δ% vs baseline</th>
+            <th>cost $</th>
+            <th>started</th>
+            <th>last update</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div data-role="overview-empty" class="empty" hidden>No campaigns matched.</div>
+  </section>
+</main>
+{% endblock %}

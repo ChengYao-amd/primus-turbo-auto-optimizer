@@ -1,0 +1,14 @@
+target_op: grouped_gemm_fp8_tensorwise
+target_backend: TRITON
+target_lang: Triton
+target_gpu: gfx950
+execution_mode: repo
+project_skill: primus-turbo-develop
+performance_target: null
+primary_metric: Combined Step TFLOPS
+target_shapes: "B=32, M=variable, N=5760, K=2880"
+kernel_source: primus_turbo/triton/grouped_gemm/grouped_gemm_fp8_kernel.py
+test_command: pytest tests/pytorch/ops/test_grouped_gemm_fp8.py -v
+benchmark_command: python benchmark/ops/bench_grouped_gemm_turbo.py --dtype fp8
+quick_command: python ${CAMPAIGN_DIR}/quick_test_bench.py
+profile_command: python ${CAMPAIGN_DIR}/profile_op_shape.py

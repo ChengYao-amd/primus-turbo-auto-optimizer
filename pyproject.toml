@@ -21,14 +21,26 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+view = [
+    "jinja2>=3.1",
+    "markdown-it-py>=3.0",
+    "bleach>=6.0",
+    "watchdog>=3.0",
+]
 
 [project.scripts]
 primus-turbo-optimize = "turbo_optimize.cli:main"
+primus-turbo-view     = "turbo_view.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["turbo_optimize*"]
+include = ["turbo_optimize*", "turbo_view*"]
 exclude = ["agent_workspace*", "tests*"]
 
 [tool.setuptools.package-data]
 "turbo_optimize" = ["prompts/*.md"]
+"turbo_view"     = [
+    "render/templates/*.html",
+    "render/templates/panels/*.html",
+    "render/assets/*",
+]

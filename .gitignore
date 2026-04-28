@@ -3,3 +3,18 @@ __pycache__
 state/
 *.egg-info
 agent_workspace/Primus-Turbo/
+
+workspace/
+workspace.tar.gz
+
+*.tar.gz
+
+# primus-turbo-view default output dir
+**/view/index.html
+**/view/data.json
+**/view/assets/
+**/view/c/
+
+.superpowers/
+.claude/
+.pytest_cache/

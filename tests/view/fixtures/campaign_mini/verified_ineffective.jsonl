@@ -1,0 +1,1 @@
+{"round": 3, "direction": "Apply waves_per_eu=2 to the backward kernel _grouped_variable_k_gemm_kernel.", "reason": "no metric improved over current best", "modified_files": ["primus_turbo/triton/grouped_gemm/grouped_gemm_fp8_kernel.py"]}

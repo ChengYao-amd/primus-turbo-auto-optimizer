@@ -1,0 +1,6 @@
+{"ts":"2025-08-15T08:30:01Z","kind":"phase_begin","fields":{"phase":"ANALYZE","round":3}}
+{"ts":"2025-08-15T08:30:05Z","kind":"assistant","fields":{"text":"reading profile..."}}
+{"ts":"2025-08-15T08:30:42Z","kind":"tool_use","fields":{"tool":"shell","cmd":"head benchmark.csv"}}
+{"ts":"2025-08-15T08:31:55Z","kind":"idle_timeout","fields":{"elapsed_s":60,"reason":"no events"}}
+{"ts":"2025-08-15T08:32:10Z","kind":"assistant","fields":{"text":"resumed"}}
+{"ts":"2025-08-15T08:33:12Z","kind":"phase_end","fields":{"phase":"ANALYZE"}}

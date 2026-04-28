@@ -1,0 +1,28 @@
+{% extends "layout.html" %}
+{% block body %}
+{% include "panels/sticky_bar.html" %}
+<header class="page-header">
+  <h1>primus-turbo-view</h1>
+  <p class="meta">campaign rendered at {{ rendered_at }} · schema {{ schema_version }}</p>
+</header>
+
+<main>
+  <div class="detail-grid">
+    <div class="detail-main">
+      {% include "panels/perf_trend.html" %}
+      {% include "panels/profile_global.html" %}
+      <div class="cost-gantt-row">
+        {% include "panels/cost.html" %}
+        {% include "panels/gantt.html" %}
+      </div>
+      {% include "panels/heatmap.html" %}
+      {% include "panels/rounds_table.html" %}
+    </div>
+    <aside class="detail-side">
+      {% include "panels/verified_ineffective.html" %}
+      {% include "panels/token_turn_wall.html" %}
+      {% include "panels/live_tail.html" %}
+    </aside>
+  </div>
+</main>
+{% endblock %}

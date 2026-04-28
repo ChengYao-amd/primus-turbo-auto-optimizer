@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% if watch_mode %}<meta name="turbo-view-watch" content="1">{% endif %}
+  <title>{{ title or "primus-turbo-view" }}</title>
+  <link rel="stylesheet" href="{{ asset_prefix or 'assets/' }}app.css">
+  <link rel="stylesheet" href="{{ asset_prefix or 'assets/' }}markdown.css">
+</head>
+<body>
+{% block body %}{% endblock %}
+
+<script id="data" type="application/json">{{ payload_json | safe }}</script>
+<script src="{{ asset_prefix or 'assets/' }}chart.umd.min.js"></script>
+<script src="{{ asset_prefix or 'assets/' }}chartjs-plugin-annotation.min.js"></script>
+<script src="{{ asset_prefix or 'assets/' }}app.js"></script>
+</body>
+</html>
